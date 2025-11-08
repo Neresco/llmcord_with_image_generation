@@ -2,7 +2,7 @@
   llmcord with image generation.
 </h1>
 
-<h3
+<h3>
 This: https://github.com/jakobdylanc/llmcord
 
 With this: 
