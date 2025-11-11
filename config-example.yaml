@@ -93,7 +93,10 @@ llm:
     \ Emotion, Logic and a structured dialectic in the response.\nStructure the response\
     \ in easy to read paragraphs.\n"
   web_search:
-    max_results: 15
+    max_results: 7
     search_url: https://searx.rhscz.eu/search #look a publix instance up at https://searx.space/#
-    timeout: 60
+    timeout: 30
+    max_images_per_result: 1  # Maximum number of images to extract per search result
+    fetch_page_images: true  # Whether to scrape pages for images
+    use_image_engines: true  # Whether to try image-focused search engines
     error_message: "Search service temporarily unavailable. The search engine may be experiencing issues or require API access."
