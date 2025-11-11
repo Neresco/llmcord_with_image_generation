@@ -9,7 +9,7 @@
 This: https://github.com/jakobdylanc/llmcord
 
 With this: 
-koboldcpp/Qwen3-Coder-REAP-246B-A35B-MXFP4_MOE-00001-of-00007
+koboldcpp/Qwen3-Coder-REAP-246B-A35B-MXFP4_MOE-00001-of-00007\n
 koboldcpp/cerebras_GLM-4.5-Air-REAP-82B-A12B-IQ4_NL
 
 Made into this: [https://github.com/Neresco/llmcord_with_image_generation_and_websearch](https://github.com/Neresco/llmcord_with_image_generation_and_websearch)
