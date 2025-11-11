@@ -93,10 +93,14 @@ discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=No
 httpx_client = httpx.AsyncClient()
 
 # Web search function - UPDATED VERSION
+# Web search function - WITH IMAGE EXTRACTION
+# Web search function - IMPROVED VERSION WITH BETTER IMAGE EXTRACTION
+# Web search function - WITH IMAGE EXTRACTION FROM SEPARATE REQUESTS
 async def web_search(query: str) -> dict:
     """Perform web search using SearXNG endpoint"""
     base_url = config["llm"]["web_search"]["search_url"]
     max_results = config["llm"]["web_search"].get("max_results", 5)
+    max_images_per_result = config["llm"]["web_search"].get("max_images_per_result", 2)
     timeout = config["llm"]["web_search"].get("timeout", 30)
     
     # Try JSON API first
@@ -110,27 +114,127 @@ async def web_search(query: str) -> dict:
         response = await httpx_client.get(base_url, params=params, timeout=timeout)
         logging.info(f"JSON Response status: {response.status_code}")
         
-        # Check if we got a forbidden response
-        if response.status_code == 403:
-            logging.warning("JSON API returned Forbidden, trying HTML parsing...")
-            raise Exception("Forbidden")
-            
         # Check if we got JSON
         content_type = response.headers.get('content-type', '')
         if 'application/json' in content_type:
             data = response.json()
             logging.info(f"Successfully parsed JSON response")
             
-            # Extract and format results
+            # Extract basic results
             results = []
             for result in data.get("results", [])[:max_results]:
                 results.append({
                     "title": result.get("title", ""),
                     "url": result.get("url", ""),
-                    "content": result.get("content", "")[:200] + "..." if len(result.get("content", "")) > 200 else result.get("content", "")
+                    "content": result.get("content", "")[:200] + "..." if len(result.get("content", "")) > 200 else result.get("content", ""),
+                    "images": []  # Will be populated later
                 })
                 
-            return {"success": True, "results": results}
+            if results:
+                logging.info(f"Found {len(results)} results from JSON API, now fetching images...")
+                
+                # Try to get images for each result
+                for i, result in enumerate(results):
+                    try:
+                        # Extract domain from URL to try finding images
+                        import urllib.parse
+                        parsed_url = urllib.parse.urlparse(result["url"])
+                        domain = parsed_url.netloc
+                        
+                        # Try different image search strategies
+                        images_found = False
+                        
+                        # Strategy 1: Look for images on the page itself
+                        if not images_found and max_images_per_result > 0:
+                            try:
+                                page_response = await httpx_client.get(result["url"], timeout=10)
+                                if page_response.status_code == 200:
+                                    from bs4 import BeautifulSoup
+                                    soup = BeautifulSoup(page_response.text, 'html.parser')
+                                    
+                                    # Common image selectors
+                                    image_selectors = [
+                                        'img[src*="jpg"]',
+                                        'img[src*="jpeg"]', 
+                                        'img[src*="png"]',
+                                        'img[src*="gif"]',
+                                        'img[src*="webp"]',
+                                        '.content img',
+                                        '.post img',
+                                        '.article img',
+                                        'img'
+                                    ]
+                                    
+                                    for selector in image_selectors:
+                                        images = soup.select(selector)[:max_images_per_result]
+                                        if images:
+                                            result["images"] = []
+                                            for img in images:
+                                                img_url = img.get('src', '')
+                                                if img_url and not img_url.startswith(('http://', 'https://')):
+                                                    # Convert relative URL to absolute
+                                                    if img_url.startswith('//'):
+                                                        img_url = f"https:{img_url}"
+                                                    elif img_url.startswith('/'):
+                                                        base_url = f"{parsed_url.scheme}://{domain}"
+                                                        img_url = f"{base_url}{img_url}"
+                                                    else:
+                                                        base_path = "/".join(parsed_url.path.split('/')[:-1])
+                                                        img_url = f"{parsed_url.scheme}://{domain}{base_path}/{img_url}"
+                                                
+                                                if img_url and (img_url.startswith(('http://', 'https://'))):
+                                                    alt_text = img.get('alt', '')
+                                                    result["images"].append({
+                                                        "url": img_url,
+                                                        "alt": alt_text
+                                                    })
+                                            
+                                            if result["images"]:
+                                                images_found = True
+                                                logging.info(f"Found {len(result['images'])} images on page: {result['title']}")
+                                                break
+                            except Exception as e:
+                                logging.debug(f"Failed to fetch images from {result['url']}: {e}")
+                        
+                        # Strategy 2: Use SearXNG's image search API if available
+                        if not images_found and max_images_per_result > 0:
+                            try:
+                                # Try to use the same base URL but with different parameters
+                                image_params = {
+                                    "q": query,
+                                    "format": "json",
+                                    "engines": ["bing", "duckduckgo-images"],  # Image-focused engines
+                                }
+                                
+                                image_response = await httpx_client.get(base_url, params=image_params, timeout=timeout)
+                                if image_response.status_code == 200 and 'application/json' in image_response.headers.get('content-type', ''): 
+                                    image_data = image_response.json()
+                                    if image_data.get("results"):
+                                        result["images"] = []
+                                        for img_result in image_data.get("results", [])[:max_images_per_result]:
+                                            img_url = img_result.get("img_src", img_result.get("url", ""))
+                                            if img_url and img_url.startswith(('http://', 'https://')):
+                                                result["images"].append({
+                                                    "url": img_url,
+                                                    "alt": img_result.get("title", "")
+                                                })
+                                        
+                                        if result["images"]:
+                                            images_found = True
+                                            logging.info(f"Found {len(result['images'])} images via image search API")
+                                            break
+                            except Exception as e:
+                                logging.debug(f"Image search API failed: {e}")
+                        
+                        # If no images found, log it
+                        if not images_found:
+                            logging.debug(f"No images found for: {result['title']}")
+                            
+                    except Exception as e:
+                        logging.warning(f"Error fetching images for result {i}: {e}")
+                        continue
+                
+                return {"success": True, "results": results}
         
         # If not JSON, log what we got
         logging.warning(f"Got non-JSON response. Content-Type: {content_type}")
@@ -139,7 +243,7 @@ async def web_search(query: str) -> dict:
     except Exception as e:
         logging.info(f"JSON API failed ({str(e)}), trying HTML parsing...")
     
-    # Fallback to HTML parsing
+    # Fallback to HTML parsing with image extraction
     try:
         from bs4 import BeautifulSoup
         
@@ -154,13 +258,17 @@ async def web_search(query: str) -> dict:
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
+        # Save the HTML to a file for inspection
+        with open('/tmp/searxng_response.html', 'w', encoding='utf-8') as f:
+            f.write(soup.prettify())
+        logging.info("Saved full HTML response to /tmp/searxng_response.html for debugging")
+        
         results = []
         
         # SearXNG uses specific classes for search results
-        # Try multiple selectors that work with different themes
         result_selectors = [
             '.result',
-            '.result-item',
+            '.result-item', 
             '.search-result',
             '.engine_item'
         ]
@@ -181,11 +289,29 @@ async def web_search(query: str) -> dict:
             '.result p'
         ]
         
+        # Image selectors - look for images within each result
+        image_selectors = [
+            '.result img',
+            '.result-item img',
+            '.search-result img',
+            '.engine_item img',
+            '.thumbnail img',
+            '.image img',
+            'img',
+            '.result picture img',
+            '.result figure img',
+            '.media img',
+            '.result-image img',
+            '.result-thumbnail img'
+        ]
+        
         # Find result containers
         result_containers = []
         for selector in result_selectors:
-            result_containers = soup.select(selector)
-            if result_containers:
+            found = soup.select(selector)
+            if found:
+                result_containers = found
+                logging.info(f"Found {len(found)} results using selector: {selector}")
                 break
                 
         if not result_containers:
@@ -193,6 +319,7 @@ async def web_search(query: str) -> dict:
             return {"success": False, "error": "No search results found"}
             
         # Extract results from containers
+        total_images_found = 0
         for container in result_containers[:max_results]:
             # Get title
             title = ""
@@ -212,15 +339,40 @@ async def web_search(query: str) -> dict:
                     content = content_elem.get_text(strip=True)[:200] + "..." if len(content_elem.get_text(strip=True)) > 200 else content_elem.get_text(strip=True)
                     break
                     
+            # Get images
+            images = []
+            for image_selector in image_selectors:
+                image_elems = container.select(image_selector)
+                if image_elems:
+                    logging.debug(f"Found {len(image_elems)} images with selector: {image_selector}")
+                    
+                for img in image_elems[:max_images_per_result]:
+                    img_url = img.get('src', '')
+                    # Handle relative URLs
+                    if img_url and not img_url.startswith(('http://', 'https://')):
+                        parsed_base = urllib.parse.urlparse(base_url)
+                        base = f"{parsed_base.scheme}://{parsed_base.netloc}"
+                        img_url = f"{base}{img_url}" if img_url.startswith('/') else f"{base}/{img_url}"
+                        
+                    if img_url and img_url.startswith(('http://', 'https://')):
+                        alt_text = img.get('alt', '')
+                        images.append({
+                            "url": img_url,
+                            "alt": alt_text
+                        })
+                        
+            total_images_found += len(images)
+            
             if title and url:
                 results.append({
                     "title": title,
                     "url": url,
-                    "content": content
+                    "content": content,
+                    "images": images
                 })
                 
         if results:
-            logging.info(f"Successfully parsed {len(results)} results from HTML")
+            logging.info(f"Successfully parsed {len(results)} results from HTML with {total_images_found} images")
             return {"success": True, "results": results}
         else:
             logging.error("Found containers but no results could be extracted")
@@ -876,6 +1028,7 @@ async def on_ready() -> None:
 
 
 @discord_bot.event
+@discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
     global last_task_time, current_provider, current_model
 
@@ -1078,29 +1231,72 @@ async def on_message(new_msg: discord.Message) -> None:
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
-    # Web search integration
+    # Web search integration - THIS IS THE CORRECTED SECTION
     if "web_search" in llm_config.get("active_tools", []):
-        trigger_words = ["search", "find", "google", "look up", "what is", "who is", "double check", "Doublecheck", "check again"]
-        if any(word in new_msg.content.lower() for word in trigger_words):
-            search_data = await web_search(new_msg.content)
+       trigger_words = [
+        "search", "find", "google", "look up", "what is", "who is",
+        "show me", "get me", "find me", "image", "picture", "photo",
+        "visual", "pics", "photos", "gimme", "give me", "doublecheck", "double check", "check again"
+    ]
+    
+    if any(word in new_msg.content.lower() for word in trigger_words):
+        logging.info(f"Trigger word found in message: {new_msg.content}")
+        search_data = await web_search(new_msg.content)
+        
+        if search_data["success"] and search_data["results"]:
+            # Format search results with images
+            formatted_results = []
+            total_images = 0
             
-            if search_data["success"] and search_data["results"]:
-                # Format search results
-                formatted_results = "\n\n".join(
-                    f"**{res['title']}**\n{res['content']}\n<{res['url']}>"
-                    for res in search_data["results"]
+            for res in search_data["results"]:
+                result_text = f"**{res['title']}**\n{res['content']}\n<{res['url']}>"
+                
+                # Add image information if available
+                if res.get("images"):
+                    total_images += len(res["images"])
+                    
+                    # Create a dedicated image section
+                    image_section = "\n\n🖼️ **Images found:**\n"
+                    
+                    for i, img in enumerate(res["images"], 1):
+                        alt_text = img['alt'] or f'Image {i}'
+                        image_url = img['url']
+                        
+                        # Add both a clickable link and the URL itself
+                        image_section += f"\n{i}. [{alt_text}]({image_url})\n   {image_url}\n"
+                    
+                    result_text += image_section
+                
+                formatted_results.append(result_text)
+            
+            logging.info(f"Formatted {len(formatted_results)} results with {total_images} total images")
+            
+            # Create a properly formatted search results message
+            search_content = "Here are some search results:\n\n" + "\n\n".join(formatted_results)
+            
+            # Create a new message for the search results
+            search_message = {
+                "role": "user",
+                "content": search_content
+            }
+            
+            # Insert it at position 1 (after the current user message, which is at index0)
+            messages.insert(1, search_message)
+            
+            # Log the final message content for debugging
+            logging.debug(f"Search message content preview: {search_content[:500]}...")
+            
+            # Also send the search results as a Discord message to verify they work
+            try:
+                await new_msg.channel.send(
+                    content=search_content,
+                    suppress_embeds=True  # Prevent Discord from trying to create embeds
                 )
-                
-                # Create a new message for the search results
-                search_message = {
-                    "role": "user",
-                    "content": f"Here are some search results:\n{formatted_results}"
-                }
-                
-                # Insert it at position 1 (after the current user message, which is at index0)
-                messages.insert(1, search_message)
-            else:
-                logging.warning(f"Web search failed: {search_data.get('error', 'Unknown error')}")
+                logging.info("Sent search results as separate Discord message for verification")
+            except Exception as e:
+                logging.warning(f"Failed to send search results as separate message: {e}")
+        else:
+            logging.warning(f"Web search failed: {search_data.get('error', 'Unknown error')}")
 
     # Add system prompt at the beginning of messages - FIXED VERSION
     system_prompt = llm_config.get("system_prompt") or ""
