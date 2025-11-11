@@ -10,10 +10,9 @@ This: https://github.com/jakobdylanc/llmcord
 
 With this: 
 koboldcpp/Qwen3-Coder-REAP-246B-A35B-MXFP4_MOE-00001-of-00007
-and this
 koboldcpp/cerebras_GLM-4.5-Air-REAP-82B-A12B-IQ4_NL
 
-Made into this: [https://github.com/Neresco/llmcord_with_image_generation](https://github.com/Neresco/llmcord_with_image_generation_and_websearch)
+Made into this: [https://github.com/Neresco/llmcord_with_image_generation_and_websearch](https://github.com/Neresco/llmcord_with_image_generation_and_websearch)
 
 Can be tested here: [⁠mandurin-bot](https://discord.com/channels/849937185893384223/1423438997656572075)
 </h4>
