@@ -12,6 +12,7 @@ client_id: 1421152774711939193
 llm:
   active_tools:
   - image_generator
+  - web_search
   allow_dms: true # or false admins can always
   extra_api_parameters:
     max_tokens: 4096
@@ -91,3 +92,8 @@ llm:
     \ use a mix of oxford english, aristocratic english and slum english.\nDisplay\
     \ Emotion, Logic and a structured dialectic in the response.\nStructure the response\
     \ in easy to read paragraphs.\n"
+  web_search:
+    max_results: 15
+    search_url: https://searx.rhscz.eu/search #look a publix instance up at https://searx.space/#
+    timeout: 60
+    error_message: "Search service temporarily unavailable. The search engine may be experiencing issues or require API access."
