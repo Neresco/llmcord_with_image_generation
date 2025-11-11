@@ -1,4 +1,4 @@
-# llmcord.py - v1.0.0 with image generation tested just locally
+# llmcord.py - v1.3.1
 from base64 import b64encode, b64decode
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,6 +17,8 @@ from discord.ui import LayoutView, TextDisplay
 import httpx
 from openai import AsyncOpenAI
 import yaml
+import json
+import bs4
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,7 +92,149 @@ discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=No
 
 httpx_client = httpx.AsyncClient()
 
-
+# Web search function - UPDATED VERSION
+async def web_search(query: str) -> dict:
+    """Perform web search using SearXNG endpoint"""
+    base_url = config["llm"]["web_search"]["search_url"]
+    max_results = config["llm"]["web_search"].get("max_results", 5)
+    timeout = config["llm"]["web_search"].get("timeout", 30)
+    
+    # Try JSON API first
+    try:
+        params = {
+            "q": query,
+            "format": "json",
+        }
+        
+        logging.info(f"Trying JSON API at {base_url}")
+        response = await httpx_client.get(base_url, params=params, timeout=timeout)
+        logging.info(f"JSON Response status: {response.status_code}")
+        
+        # Check if we got a forbidden response
+        if response.status_code == 403:
+            logging.warning("JSON API returned Forbidden, trying HTML parsing...")
+            raise Exception("Forbidden")
+            
+        # Check if we got JSON
+        content_type = response.headers.get('content-type', '')
+        if 'application/json' in content_type:
+            data = response.json()
+            logging.info(f"Successfully parsed JSON response")
+            
+            # Extract and format results
+            results = []
+            for result in data.get("results", [])[:max_results]:
+                results.append({
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                    "content": result.get("content", "")[:200] + "..." if len(result.get("content", "")) > 200 else result.get("content", "")
+                })
+                
+            return {"success": True, "results": results}
+        
+        # If not JSON, log what we got
+        logging.warning(f"Got non-JSON response. Content-Type: {content_type}")
+        logging.warning(f"Response preview: {response.text[:500]}")
+        
+    except Exception as e:
+        logging.info(f"JSON API failed ({str(e)}), trying HTML parsing...")
+    
+    # Fallback to HTML parsing
+    try:
+        from bs4 import BeautifulSoup
+        
+        # Make regular search request without format=json
+        params = {
+            "q": query,
+        }
+        
+        logging.info(f"Trying HTML parsing at {base_url}")
+        response = await httpx_client.get(base_url, params=params, timeout=timeout)
+        logging.info(f"HTML Response status: {response.status_code}")
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        results = []
+        
+        # SearXNG uses specific classes for search results
+        # Try multiple selectors that work with different themes
+        result_selectors = [
+            '.result',
+            '.result-item',
+            '.search-result',
+            '.engine_item'
+        ]
+        
+        title_selectors = [
+            '.title a',
+            '.result h3 a',
+            '.result-title a',
+            '.result a',
+            'h3 a'
+        ]
+        
+        content_selectors = [
+            '.content',
+            '.result .description',
+            '.result-content',
+            '.snippet',
+            '.result p'
+        ]
+        
+        # Find result containers
+        result_containers = []
+        for selector in result_selectors:
+            result_containers = soup.select(selector)
+            if result_containers:
+                break
+                
+        if not result_containers:
+            logging.error("Could not find any search result containers")
+            return {"success": False, "error": "No search results found"}
+            
+        # Extract results from containers
+        for container in result_containers[:max_results]:
+            # Get title
+            title = ""
+            url = ""
+            for title_selector in title_selectors:
+                title_elem = container.select_one(title_selector)
+                if title_elem:
+                    title = title_elem.get_text(strip=True)
+                    url = title_elem.get('href', '')
+                    break
+                    
+            # Get content
+            content = ""
+            for content_selector in content_selectors:
+                content_elem = container.select_one(content_selector)
+                if content_elem:
+                    content = content_elem.get_text(strip=True)[:200] + "..." if len(content_elem.get_text(strip=True)) > 200 else content_elem.get_text(strip=True)
+                    break
+                    
+            if title and url:
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "content": content
+                })
+                
+        if results:
+            logging.info(f"Successfully parsed {len(results)} results from HTML")
+            return {"success": True, "results": results}
+        else:
+            logging.error("Found containers but no results could be extracted")
+            return {"success": False, "error": "Failed to extract search results from HTML"}
+            
+    except Exception as e:
+        logging.exception(f"HTML parsing failed: {e}")
+    
+    # If both methods fail
+    return {
+        "success": False, 
+        "error": "Web search endpoint is not accessible or does not return valid data."
+    }
+    
 @dataclass
 class MsgNode:
     text: Optional[str] = None
@@ -248,6 +392,87 @@ async def generate_image(prompt: str, negative_prompt: str, provider_config: dic
         logging.exception(f"Error generating image: {e}")
         return None
 
+@discord_bot.tree.command(name="diagnose_websearch", description="Diagnose web search configuration (Admin only)")
+async def diagnose_websearch_command(interaction: discord.Interaction):
+    """Diagnose the web search configuration"""
+    
+    # Check if user is admin
+    config = await asyncio.to_thread(get_config)
+    permissions = config.get("permissions", {
+        "users": {
+            "admin_ids": config.get("admin_user_ids", []),
+            "allowed_ids": [],
+            "blocked_ids": []
+        }
+    })
+    
+    user_is_admin = interaction.user.id in permissions["users"]["admin_ids"]
+    
+    if not user_is_admin:
+        await interaction.response.send_message("Only administrators can use this command.", ephemeral=True)
+        return
+    
+    # Test the web search
+    result = await web_search("test query")
+    
+    embed = discord.Embed(
+        title="Web Search Diagnosis",
+        color=EMBED_COLOR_ERROR if not result["success"] else EMBED_COLOR_COMPLETE
+    )
+    
+    if result["success"]:
+        embed.description = f"✅ Web search is working!\nFound {len(result['results'])} results."
+        embed.add_field(name="Sample Result", value=result['results'][0]['title'][:100] + "..." if result['results'] else "No results", inline=False)
+    else:
+        embed.description = f"❌ Web search failed: {result['error']}"
+        
+        # Add troubleshooting tips
+        embed.add_field(
+            name="Troubleshooting Tips",
+            value=(
+                "1. Verify the endpoint URL points to an API, not a web interface\n"
+                "2. Try adding '/api' or '/search' to the base URL\n"
+                "3. Ensure the server has API enabled\n"
+                "4. Check if authentication is required"
+            ),
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@discord_bot.tree.command(name="test_websearch", description="Test the web search functionality (Admin only)")
+async def test_websearch_command(interaction: discord.Interaction):
+    """Test the web search functionality"""
+    
+    # Check if user is admin
+    config = await asyncio.to_thread(get_config)
+    permissions = config.get("permissions", {
+        "users": {
+            "admin_ids": config.get("admin_user_ids", []),
+            "allowed_ids": [],
+            "blocked_ids": []
+        }
+    })
+    
+    user_is_admin = interaction.user.id in permissions["users"]["admin_ids"]
+    
+    if not user_is_admin:
+        await interaction.response.send_message("Only administrators can use this command.", ephemeral=True)
+        return
+    
+    # Test the web search
+    result = await web_search("test query")
+    
+    if result["success"]:
+        await interaction.response.send_message(
+            f"Web search test successful! Found {len(result['results'])} results.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"Web search test failed: {result['error']}",
+            ephemeral=True
+        )
 
 # Image generation command that uses queue system
 @discord_bot.tree.command(name="image", description="Generate an image from a prompt")
@@ -487,6 +712,57 @@ async def image_providers_command(interaction: discord.Interaction, provider: st
         
     logging.info(output)
     await interaction.response.send_message(output, ephemeral=True)
+
+
+# New /tools command to toggle active tools
+@discord_bot.tree.command(name="tools", description="Toggle active tools")
+async def tools_command(interaction: discord.Interaction, tool: str, enabled: bool):
+    """Enable/disable specific tools"""
+    global config
+    
+    # Get current config
+    current_config = await asyncio.to_thread(get_config)
+    llm_config = current_config.get("llm", {})
+    active_tools = llm_config.get("active_tools", [])
+    
+    # Define available tools
+    available_tools = ["image_generator", "web_search"]
+    
+    if tool not in available_tools:
+        await interaction.response.send_message(
+            f"Tool '{tool}' not found. Available tools: {', '.join(available_tools)}", 
+            ephemeral=True
+        )
+        return
+    
+    # Update the active_tools list
+    if enabled and tool not in active_tools:
+        active_tools.append(tool)
+    elif not enabled and tool in active_tools:
+        active_tools.remove(tool)
+    
+    # Update the config file
+    try:
+        with open("config.yaml", "w") as f:
+            yaml.dump(current_config, f, default_flow_style=False, allow_unicode=True)
+        
+        status = "enabled" if enabled else "disabled"
+        message = f"Tool '{tool}' has been {status}."
+        logging.info(message)
+        await interaction.response.send_message(message, ephemeral=True)
+        
+    except Exception as e:
+        error_msg = f"Failed to update tool settings: {e}"
+        logging.error(error_msg)
+        await interaction.response.send_message(error_msg, ephemeral=True)
+
+@tools_command.autocomplete("tool")
+async def tools_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
+    """Autocomplete for tool names"""
+    available_tools = ["image_generator", "web_search"]
+    filtered_tools = [t for t in available_tools if curr_str.lower() in t.lower()]
+    
+    return [Choice(name=t, value=t) for t in filtered_tools[:25]]
 
 
 # New /allow_dm command for admins to toggle DM functionality
@@ -802,6 +1078,30 @@ async def on_message(new_msg: discord.Message) -> None:
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
+    # Web search integration
+    if "web_search" in llm_config.get("active_tools", []):
+        trigger_words = ["search", "find", "google", "look up", "what is", "who is", "double check", "Doublecheck", "check again"]
+        if any(word in new_msg.content.lower() for word in trigger_words):
+            search_data = await web_search(new_msg.content)
+            
+            if search_data["success"] and search_data["results"]:
+                # Format search results
+                formatted_results = "\n\n".join(
+                    f"**{res['title']}**\n{res['content']}\n<{res['url']}>"
+                    for res in search_data["results"]
+                )
+                
+                # Create a new message for the search results
+                search_message = {
+                    "role": "user",
+                    "content": f"Here are some search results:\n{formatted_results}"
+                }
+                
+                # Insert it at position 1 (after the current user message, which is at index0)
+                messages.insert(1, search_message)
+            else:
+                logging.warning(f"Web search failed: {search_data.get('error', 'Unknown error')}")
+
     # Add system prompt at the beginning of messages - FIXED VERSION
     system_prompt = llm_config.get("system_prompt") or ""
     
@@ -813,8 +1113,8 @@ async def on_message(new_msg: discord.Message) -> None:
         if accept_usernames:
             system_prompt += "\n\nUser's names are their Discord IDs and should be typed as '<@ID>'."
 
-        # IMPORTANT: Insert system prompt at the beginning, not append it at the end
-        messages.insert(0, dict(role="system", content=system_prompt))
+        # IMPORTANT: Append system prompt to the end of the reverse-chronological list
+        messages.append(dict(role="system", content=system_prompt))
     else:
         logging.info("No system prompt found in config")
 
