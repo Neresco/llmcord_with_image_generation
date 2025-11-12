@@ -100,3 +100,12 @@ llm:
     fetch_page_images: true  # Whether to scrape pages for images
     use_image_engines: true  # Whether to try image-focused search engines
     error_message: "Search service temporarily unavailable. The search engine may be experiencing issues or require API access."
+    trigger_words:
+      - "search"
+      - "find"
+      - "google"
+      - "look up"
+      - "who is"
+      - "double check"
+      - "check again"
+      - "doublecheck"
