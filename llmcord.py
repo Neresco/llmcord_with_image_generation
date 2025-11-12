@@ -1233,13 +1233,20 @@ async def on_message(new_msg: discord.Message) -> None:
 
     # Web search integration - THIS IS THE CORRECTED SECTION
     if "web_search" in llm_config.get("active_tools", []):
-       trigger_words = [
-        "search", "find", "google", "look up", "who is", "find me", "double check", "check again"
-    ]
+    # Get trigger words from config with fallback defaults
+      web_search_config = llm_config.get("web_search", {})
+      trigger_words = web_search_config.get("trigger_words", [
+        "search", "find", "google", "look up", "who is", 
+        "find me", "double check", "check again", "what is", "doublecheck"
+    ])
     
     if any(word in new_msg.content.lower() for word in trigger_words):
         logging.info(f"Trigger word found in message: {new_msg.content}")
         search_data = await web_search(new_msg.content)
+        
+        if search_data["success"] and search_data["results"]:
+          logging.info(f"Trigger word found in message: {new_msg.content}")
+          search_data = await web_search(new_msg.content)
         
         if search_data["success"] and search_data["results"]:
             # Format search results with images
