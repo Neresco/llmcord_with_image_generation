@@ -1234,9 +1234,7 @@ async def on_message(new_msg: discord.Message) -> None:
     # Web search integration - THIS IS THE CORRECTED SECTION
     if "web_search" in llm_config.get("active_tools", []):
        trigger_words = [
-        "search", "find", "google", "look up", "what is", "who is",
-        "show me", "get me", "find me", "image", "picture", "photo",
-        "visual", "pics", "photos", "gimme", "give me", "doublecheck", "double check", "check again"
+        "search", "find", "google", "look up", "who is", "find me", "double check", "check again"
     ]
     
     if any(word in new_msg.content.lower() for word in trigger_words):
