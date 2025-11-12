@@ -4,17 +4,17 @@
 </h1>
 
 <h4>
-Websearch Triggerwords are now in the config.yaml
+Websearch Triggerwords are now in the config.yaml\
 
-This are the command:
-/providers = select text model providers from the config.yaml
-/image_providers = select image model providers from the config.yaml
-/image insert prompt text here = creates an image of the prompt from the selected image provider
-/image_advanced = more options for image generation over Chat
-/allow_dm = turn on and off direct messages to the bot  (Admin rights needed and Admins can do this always.)
-/tools = turn on and off websearch module and image generation module
-/test_websearch = simple Websearch test
-/diagnose_websearch = more detailed websearch test.
+This are the command:\
+/providers = select text model providers from the config.yaml\
+/image_providers = select image model providers from the config.yaml\
+/image insert prompt text here = creates an image of the prompt from the selected image provider\
+/image_advanced = more options for image generation over Chat\
+/allow_dm = turn on and off direct messages to the bot  (Admin rights needed and Admins can do this always.)\
+/tools = turn on and off websearch module and image generation module\
+/test_websearch = simple Websearch test\
+/diagnose_websearch = more detailed websearch test.\
 </h4>
 
 <h4>
