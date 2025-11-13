@@ -19,6 +19,7 @@ from openai import AsyncOpenAI
 import yaml
 import json
 import bs4
+import urllib.parse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,9 +94,6 @@ discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=No
 httpx_client = httpx.AsyncClient()
 
 # Web search function - UPDATED VERSION
-# Web search function - WITH IMAGE EXTRACTION
-# Web search function - IMPROVED VERSION WITH BETTER IMAGE EXTRACTION
-# Web search function - WITH IMAGE EXTRACTION FROM SEPARATE REQUESTS
 async def web_search(query: str) -> dict:
     """Perform web search using SearXNG endpoint"""
     base_url = config["llm"]["web_search"]["search_url"]
@@ -137,7 +135,6 @@ async def web_search(query: str) -> dict:
                 for i, result in enumerate(results):
                     try:
                         # Extract domain from URL to try finding images
-                        import urllib.parse
                         parsed_url = urllib.parse.urlparse(result["url"])
                         domain = parsed_url.netloc
                         
@@ -386,7 +383,47 @@ async def web_search(query: str) -> dict:
         "success": False, 
         "error": "Web search endpoint is not accessible or does not return valid data."
     }
+
+# Helper function to format search results
+def format_search_results(search_data: dict) -> str:
+    """Format web search results into a readable string."""
+    if not search_data.get("success"):
+        return f"Search failed: {search_data.get('error', 'Unknown error')}"
     
+    results = search_data.get("results", [])
+    if not results:
+        return "No search results found."
+    
+    formatted = []
+    for i, res in enumerate(results, 1):
+        title = res.get("title", "Untitled")
+        content = res.get("content", "No content available.")
+        url = res.get("url", "")
+        
+        # Truncate content if too long
+        if len(content) > 200:
+            content = content[:200] + "..."
+        
+        # Format each result
+        result_text = f"{i}. [{title}]({url})\n   {content}"
+        
+        # Add images if any
+        images = res.get("images", [])
+        if images:
+            image_urls = [f"[{img.get('alt', f'Image {j+1}')}]( {img['url']} )" for j, img in enumerate(images)]
+            result_text += "\n   🖼️ Images: " + ", ".join(image_urls)
+        
+        formatted.append(result_text)
+    
+    full_text = "Here are some search results:\n\n" + "\n\n".join(formatted)
+    
+    # Truncate the entire text if too long
+    max_length = 2000
+    if len(full_text) > max_length:
+        full_text = full_text[:max_length-3] + "..."
+    
+    return full_text
+
 @dataclass
 class MsgNode:
     text: Optional[str] = None
@@ -1028,7 +1065,6 @@ async def on_ready() -> None:
 
 
 @discord_bot.event
-@discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
     global last_task_time, current_provider, current_model
 
@@ -1231,77 +1267,40 @@ async def on_message(new_msg: discord.Message) -> None:
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
-    # Web search integration - THIS IS THE CORRECTED SECTION
+    # Web search integration - UPDATED VERSION
     if "web_search" in llm_config.get("active_tools", []):
-    # Get trigger words from config with fallback defaults
-      web_search_config = llm_config.get("web_search", {})
-      trigger_words = web_search_config.get("trigger_words", [
-        "search", "find", "google", "look up", "who is", 
-        "find me", "double check", "check again", "what is", "doublecheck"
-    ])
-    
-    if any(word in new_msg.content.lower() for word in trigger_words):
-        logging.info(f"Trigger word found in message: {new_msg.content}")
-        search_data = await web_search(new_msg.content)
+        # Get trigger words from config with fallback defaults
+        web_search_config = llm_config.get("web_search", {})
+        trigger_words = web_search_config.get("trigger_words", [
+            "search", "find", "google", "look up", "who is", 
+            "find me", "double check", "check again", "what is", "doublecheck"
+        ])
         
-        if search_data["success"] and search_data["results"]:
-          logging.info(f"Trigger word found in message: {new_msg.content}")
-          search_data = await web_search(new_msg.content)
-        
-        if search_data["success"] and search_data["results"]:
-            # Format search results with images
-            formatted_results = []
-            total_images = 0
+        if any(word in new_msg.content.lower() for word in trigger_words):
+            logging.info(f"Trigger word found in message: {new_msg.content}")
+            search_data = await web_search(new_msg.content)
             
-            for res in search_data["results"]:
-                result_text = f"**{res['title']}**\n{res['content']}\n<{res['url']}>"
+            if search_data["success"] and search_data["results"]:
+                formatted_search = format_search_results(search_data)
                 
-                # Add image information if available
-                if res.get("images"):
-                    total_images += len(res["images"])
-                    
-                    # Create a dedicated image section
-                    image_section = "\n\n🖼️ **Images found:**\n"
-                    
-                    for i, img in enumerate(res["images"], 1):
-                        alt_text = img['alt'] or f'Image {i}'
-                        image_url = img['url']
-                        
-                        # Add both a clickable link and the URL itself
-                        image_section += f"\n{i}. [{alt_text}]({image_url})\n   {image_url}\n"
-                    
-                    result_text += image_section
+                # Insert as a new message in the conversation history
+                search_message = {
+                    "role": "user",
+                    "content": formatted_search
+                }
+                messages.insert(1, search_message)  # After the original user message
                 
-                formatted_results.append(result_text)
-            
-            logging.info(f"Formatted {len(formatted_results)} results with {total_images} total images")
-            
-            # Create a properly formatted search results message
-            search_content = "Here are some search results:\n\n" + "\n\n".join(formatted_results)
-            
-            # Create a new message for the search results
-            search_message = {
-                "role": "user",
-                "content": search_content
-            }
-            
-            # Insert it at position 1 (after the current user message, which is at index0)
-            messages.insert(1, search_message)
-            
-            # Log the final message content for debugging
-            logging.debug(f"Search message content preview: {search_content[:500]}...")
-            
-            # Also send the search results as a Discord message to verify they work
-            try:
-                await new_msg.channel.send(
-                    content=search_content,
-                    suppress_embeds=True  # Prevent Discord from trying to create embeds
-                )
-                logging.info("Sent search results as separate Discord message for verification")
-            except Exception as e:
-                logging.warning(f"Failed to send search results as separate message: {e}")
-        else:
-            logging.warning(f"Web search failed: {search_data.get('error', 'Unknown error')}")
+                # Optionally send as separate message for verification
+                try:
+                    await new_msg.channel.send(
+                        content=formatted_search,
+                        suppress_embeds=True
+                    )
+                    logging.info("Sent search results as separate Discord message for verification")
+                except Exception as e:
+                    logging.warning(f"Failed to send search results as separate message: {e}")
+            else:
+                logging.warning(f"Web search failed: {search_data.get('error', 'Unknown error')}")
 
     # Add system prompt at the beginning of messages - FIXED VERSION
     system_prompt = llm_config.get("system_prompt") or ""
