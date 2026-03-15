@@ -110,11 +110,164 @@ def extract_reasoning(content: str, start_tag: str, end_tag: str) -> tuple[str, 
     
     # Create clean content without reasoning section
     clean_content = (
-        content[:reasoning_start].rstrip() + 
+        content[:reasoning_start].rstrip() +
         content[reasoning_end + len(end_tag):].lstrip()
     )
     
     return clean_content, reasoning_content
+
+def strip_all_thinking_tags(content: str, thinking_tags: List[str] = None) -> str:
+    """
+    Remove all thinking/reasoning tags and their content from the response.
+    Uses regex for robust pattern matching across multiple tag variations.
+    
+    Args:
+        content: The text content to clean
+        thinking_tags: List of tag pairs to strip. If None, uses common defaults.
+    
+    Returns:
+        Cleaned content with all thinking blocks removed
+    """
+    if thinking_tags is None:
+        # Default common thinking tag patterns - covers KoboldCPP, llama.cpp, Ollama, etc.
+        thinking_tags = [
+            "<thinking>",
+            "<think>",
+            "<THINKING>",
+            "<reason>",
+            "<reasoning>",
+            "<think>",
+            "<|begin_of_thought|>",
+            "<|end_of_thought|>",
+            "<thought>",
+            "<|begin_thought|>",
+            "<|end_thought|>",
+            "",
+            "</think>",
+            "<|start_thinking|>",
+            "<|end_thinking|>",
+        ]
+    
+    clean_content = content
+    
+    for tag in thinking_tags:
+        # Escape special regex characters in the tag
+        escaped_tag = re.escape(tag)
+        
+        # Create pattern to match opening tag, content, and closing tag
+        # Handle both self-closing tags and paired tags
+        closing_tag = tag.replace("<", "</") if tag.startswith("<") else f"</{tag}>"
+        escaped_closing = re.escape(closing_tag)
+        
+        # Pattern for paired tags: <tag>content</tag>
+        pattern = f"{escaped_tag}.*?{escaped_closing}"
+        
+        # Remove all matches (case-insensitive for flexibility)
+        clean_content = re.sub(pattern, "", clean_content, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Also handle empty or malformed tags that might slip through
+    # Remove any standalone opening or closing tags
+    for tag in thinking_tags:
+        escaped_tag = re.escape(tag)
+        closing_tag = tag.replace("<", "</") if tag.startswith("<") else f"</{tag}>"
+        escaped_closing = re.escape(closing_tag)
+        
+        # Remove orphan tags
+        clean_content = re.sub(escaped_tag, "", clean_content, flags=re.IGNORECASE)
+        clean_content = re.sub(escaped_closing, "", clean_content, flags=re.IGNORECASE)
+    
+    # Clean up extra whitespace left behind
+    clean_content = re.sub(r'\n\s*\n\s*\n', '\n\n', clean_content)
+    clean_content = clean_content.strip()
+    
+    return clean_content
+
+def create_thinking_buffer_processor(thinking_tags: List[str] = None):
+    """
+    Create a closure that maintains state for streaming thinking tag removal.
+    This buffers partial tags during streaming to prevent them from being displayed.
+    
+    Returns:
+        A function that processes streaming chunks and returns clean content
+    """
+    if thinking_tags is None:
+        # Default common thinking tag patterns - covers Qwen3.5, KoboldCPP, llama.cpp, Ollama, etc.
+        thinking_tags = [
+            "<think>",
+            "</think>",
+            "<thinking>",
+            "</thinking>",
+            "<THINKING>",
+            "</THINKING>",
+            "<reason>",
+            "</reason>",
+            "<reasoning>",
+            "</reasoning>",
+            "<|begin_of_thought|>",
+            "<|end_of_thought|>",
+            "<thought>",
+            "<|begin_thought|>",
+            "<|end_thought|>",
+            "<|start_thinking|>",
+            "<|end_thinking|>",
+        ]
+    
+    # Build patterns for opening and closing tags
+    opening_patterns = []
+    closing_patterns = []
+    
+    for tag in thinking_tags:
+        opening_patterns.append(re.escape(tag))
+        closing_tag = tag.replace("<", "</") if tag.startswith("<") else f"</{tag}>"
+        closing_patterns.append(re.escape(closing_tag))
+    
+    # State buffers
+    buffer = ""
+    inside_thinking = False
+    
+    def process_chunk(chunk: str) -> str:
+        nonlocal buffer, inside_thinking
+        
+        # Append new chunk to buffer
+        buffer += chunk
+        
+        # Check if we're entering thinking mode
+        for pattern in opening_patterns:
+            if re.search(pattern, buffer, re.IGNORECASE):
+                inside_thinking = True
+                break
+        
+        # If we're not inside thinking, return the buffer and clear it
+        if not inside_thinking:
+            result = buffer
+            buffer = ""
+            return result
+        
+        # Check if thinking mode is ending
+        for pattern in closing_patterns:
+            if re.search(pattern, buffer, re.IGNORECASE):
+                # Found closing tag, extract content after it
+                match = re.search(pattern, buffer, re.IGNORECASE | re.DOTALL)
+                if match:
+                    buffer = buffer[match.end():]
+                    inside_thinking = False
+                break
+        
+        # If still inside thinking, return empty string (buffer holds the thinking content)
+        if inside_thinking:
+            return ""
+        
+        # Just exited thinking, return any content after the closing tag
+        result = buffer
+        buffer = ""
+        return result
+    
+    def reset():
+        nonlocal buffer, inside_thinking
+        buffer = ""
+        inside_thinking = False
+    
+    return process_chunk, reset
 
 def process_reasoning_content(
     content: str, 
@@ -1200,7 +1353,22 @@ async def on_message(new_msg: discord.Message) -> None:
 
     extra_headers = provider_config.get("extra_headers")
     extra_query = provider_config.get("extra_query")
-    extra_body = (provider_config.get("extra_body") or {}) | (model_parameters or {}) or None
+    
+    # Check if we should disable thinking for Qwen3.5 models
+    reasoning_config = llm_config.get("reasoning") or {}
+    completely_disable_reasoning = reasoning_config.get("completely_disable_reasoning", False)
+    
+    # Build extra_body with thinking disabled if configured
+    base_extra_body = provider_config.get("extra_body") or {}
+    if model_parameters:
+        base_extra_body = base_extra_body | model_parameters
+    
+    # Add Qwen3.5 thinking disable parameter if completely_disable_reasoning is true
+    if completely_disable_reasoning:
+        # Qwen3.5 API parameter to disable thinking
+        base_extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    
+    extra_body = base_extra_body if base_extra_body else None
 
     accept_images = any(x in current_model.lower() for x in VISION_MODEL_TAGS) if current_model else False
     accept_usernames = any(current_provider.lower().startswith(x) for x in PROVIDERS_SUPPORTING_USERNAMES)
@@ -1212,11 +1380,6 @@ async def on_message(new_msg: discord.Message) -> None:
     messages = []
     user_warnings = set()
     curr_msg = new_msg
-
-    # Track if we have a user message in the conversation
-    user_message_found = False
-    user_display_name = None
-    user_id_for_mention = None
 
     while curr_msg != None and len(messages) < max_messages:
         curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
@@ -1236,38 +1399,12 @@ async def on_message(new_msg: discord.Message) -> None:
                     + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
                 )
 
-                # --- FIXED VISION HANDLING ---
-                # Determine if we should send images to the LLM based on:
-                # 1. Current model being a vision model, OR
-                # 2. Message having images AND being relevant to images
-                has_image_attachments = any(att.content_type and att.content_type.startswith("image") for att in new_msg.attachments)
-                image_relevant_prompt = any(word in new_msg.content.lower() for word in ["image", "picture", "photo", "what is in", "describe", "see", "looking at"])
-
-                # Always enable image sending when there are images AND the prompt is image-related
-                # Even if the model doesn't support vision natively
-                if has_image_attachments and image_relevant_prompt:
-                    # Override the accept_images flag to always include images
-                    accept_images = True
-                    max_images = 5  # Ensure we can send up to 5 images
-
-                # Build image data for messages
-                if has_image_attachments and image_relevant_prompt:
-                    good_attachments = [att for att in new_msg.attachments if att.content_type and att.content_type.startswith("image")]
-                    attachment_responses = await asyncio.gather(*[httpx_client.get(att.url) for att in good_attachments])
-                    curr_node.images = [
-                        dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
-                        for att, resp in zip(good_attachments, attachment_responses)
-                        if att.content_type.startswith("image")
-                    ]
-                else:
-                    curr_node.images = []
-
-                # Build the final content for the LLM
-                if curr_node.images[:max_images]:
-                    content = ([dict(type="text", text=curr_node.text[:max_text])] if curr_node.text[:max_text] else []) + curr_node.images[:max_images]
-                else:
-                    content = curr_node.text[:max_text]
-
+                curr_node.images = [
+                    dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
+                    for att, resp in zip(good_attachments, attachment_responses)
+                    if att.content_type.startswith("image")
+                ]
+                
                 curr_node.role = "assistant" if new_msg.author == discord_bot.user else "user"
 
                 curr_node.user_id = new_msg.author.id if curr_node.role == "user" else None
@@ -1297,42 +1434,12 @@ async def on_message(new_msg: discord.Message) -> None:
                     logger.exception("Error fetching next message in the chain")
                     curr_node.fetch_parent_failed = True
 
-            # Track user message information for later use
-            if curr_node.role == "user" and curr_node.user_id:
-                user_message_found = True
-                user_id_for_mention = curr_node.user_id
-                try:
-                    user = await discord_bot.fetch_user(curr_node.user_id)
-                    user_display_name = user.display_name
-                except:
-                    user_display_name = str(curr_node.user_id)
+            if curr_node.images[:max_images]:
+                content = ([dict(type="text", text=curr_node.text[:max_text])] if curr_node.text[:max_text] else []) + curr_node.images[:max_images]
+            else:
+                content = curr_node.text[:max_text]
 
-            # Include user display name in content for user messages when appropriate
             if content != "":
-                # Add user mention to the content for user messages
-                if curr_node.role == "user" and accept_usernames and curr_node.user_id:
-                    try:
-                        user = await discord_bot.fetch_user(curr_node.user_id)
-                        display_name = user.display_name
-                        # Add user mention to the start of content for user messages
-                        if isinstance(content, list):  # For vision model content
-                            # For vision models, we need to add it to the text part
-                            if content[0].get('type') == 'text':
-                                content[0]['text'] = f"@{display_name} {content[0]['text']}"
-                        else:
-                            # For regular text, prepend the mention
-                            if not content.startswith(f"@{display_name}"):
-                                content = f"@{display_name} {content}"
-                    except Exception as e:
-                        logger.warning(f"Could not fetch user {curr_node.user_id}: {e}")
-                        # Fallback to user ID if we can't fetch the user
-                        if isinstance(content, list):
-                            if content[0].get('type') == 'text':
-                                content[0]['text'] = f"@{curr_node.user_id} {content[0]['text']}"
-                        else:
-                            if not content.startswith(f"@{curr_node.user_id}"):
-                                content = f"@{curr_node.user_id} {content}"
-                
                 message = dict(content=content, role=curr_node.role)
                 if accept_usernames and curr_node.user_id != None:
                     try:
@@ -1475,16 +1582,26 @@ async def on_message(new_msg: discord.Message) -> None:
     # System prompt handling
     system_prompt = llm_config.get("system_prompt") or ""
     
+    # Check for assistant_prefix (e.g., /nothink for KoboldCPP)
+    assistant_prefix = llm_config.get("assistant_prefix")
+    
     if system_prompt:
         now = datetime.now().astimezone()
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
         
         if accept_usernames:
-            system_prompt += "\n\nWhen responding to users in Discord, always mention the user by their display name (e.g., 'Hello @username!')."
+            system_prompt += "\n\n{{user}} names are their Discord display names."
+        
+        # Add assistant_prefix to system prompt if configured
+        if assistant_prefix:
+            system_prompt += f"\n\n{assistant_prefix}"
 
         messages.append(dict(role="system", content=system_prompt))
     else:
         logger.info("No system prompt found in config")
+        # If no system prompt but assistant_prefix exists, create minimal message
+        if assistant_prefix:
+            messages.append(dict(role="system", content=assistant_prefix))
 
     # Generate response
     curr_content = finish_reason = None
@@ -1543,19 +1660,37 @@ async def on_message(new_msg: discord.Message) -> None:
 
                     if start_next_msg or ready_to_edit or is_final_edit:
                         # Process reasoning sections based on configuration
-                        reasoning_config = llm_config.get("reasoning", {})
+                        reasoning_config = llm_config.get("reasoning") or {}
                         show_reasoning = reasoning_config.get("show_reasoning", True)
                         reasoning_format = reasoning_config.get("reasoning_format", "spoiler")
                         start_tag = reasoning_config.get("reasoning_start_tag", "<THINKING>")
                         end_tag = reasoning_config.get("reasoning_end_tag", "</THINKING>")
+                        disable_thinking_display = reasoning_config.get("disable_thinking_display", False)
+                        thinking_tags_config = reasoning_config.get("thinking_tags", None)
+                        completely_disable_reasoning = reasoning_config.get("completely_disable_reasoning", False)
+                        
+                        # Debug logging to verify config is read correctly
+                        logger.info(f"Reasoning config check: completely_disable={completely_disable_reasoning}, disable_display={disable_thinking_display}, show={show_reasoning}")
+                        logger.info(f"Reasoning config raw: {reasoning_config}")
                         
                         # Remove the STREAMING_INDICATOR from the displayed content
                         display_content = response_contents[-1]
                         if display_content.endswith(STREAMING_INDICATOR):
                             display_content = display_content[:-len(STREAMING_INDICATOR)]
                         
-                        # Apply reasoning processing if enabled
-                        if show_reasoning and display_content:
+                        # Apply robust thinking tag removal if thinking display is disabled
+                        if completely_disable_reasoning and display_content:
+                            # Completely strip all thinking tags and content - no reasoning at all
+                            logger.info(f"Stripping thinking tags (completely_disable_reasoning). Original length: {len(display_content)}")
+                            final_content = strip_all_thinking_tags(display_content, thinking_tags_config)
+                            logger.info(f"After stripping length: {len(final_content)}")
+                        elif disable_thinking_display and display_content:
+                            # Use the new regex-based stripping for robust tag removal
+                            logger.info(f"Stripping thinking tags (disable_thinking_display). Original length: {len(display_content)}")
+                            final_content = strip_all_thinking_tags(display_content, thinking_tags_config)
+                            logger.info(f"After stripping length: {len(final_content)}")
+                        elif show_reasoning and display_content:
+                            # Legacy reasoning processing for spoiler/separate formats
                             processed_content, reasoning_content, has_reasoning = process_reasoning_content(
                                 display_content,
                                 reasoning_format,
@@ -1568,23 +1703,16 @@ async def on_message(new_msg: discord.Message) -> None:
                                 final_content = processed_content
                             elif reasoning_format == "separate" and has_reasoning:
                                 final_content = processed_content
-                                # Note: We'll handle the separate message view in final processing
                             else:
                                 final_content = display_content
                         else:
                             # Completely remove reasoning sections if not showing
                             clean_content, _ = extract_reasoning(display_content, start_tag, end_tag)
-                            final_content = clean_content
+                            final_content = clean_content if clean_content else display_content
                         
                         # Truncate if needed
                         if len(final_content) > max_message_length:
                             final_content = final_content[:max_message_length-3] + "..."
-                        
-                        # Add user mention to the beginning of the response if it's a user message
-                        if user_message_found and user_display_name and not final_content.strip().startswith(f"@{user_display_name}"):
-                            # Check if response already mentions the user to avoid duplication
-                            if f"@{user_display_name}" not in final_content:
-                                final_content = f"@{user_display_name} {final_content}"
                         
                         embed.description = final_content if is_final_edit else final_content
                         embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
@@ -1599,11 +1727,6 @@ async def on_message(new_msg: discord.Message) -> None:
 
             if use_plain_responses:
                 for content in response_contents:
-                    # Add user mention to the beginning of the response if it's a user message
-                    if user_message_found and user_display_name and not content.strip().startswith(f"@{user_display_name}"):
-                        # Check if response already mentions the user to avoid duplication
-                        if f"@{user_display_name}" not in content:
-                            content = f"@{user_display_name} {content}"
                     await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
 
     except Exception as e:
