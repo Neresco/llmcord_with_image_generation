@@ -1,34 +1,3 @@
-<h1 align="center">
-  llmcord with image generation and Websearch.
-  Bloated up from 200 lines Original Code to 1415 lines.
-</h1>
-
-<h4>
-Websearch Triggerwords are now in the config.yaml\
-
-This are the command:\
-/providers = select text model providers from the config.yaml\
-/image_providers = select image model providers from the config.yaml\
-/image insert prompt text here = creates an image of the prompt from the selected image provider\
-/image_advanced = more options for image generation over Chat\
-/allow_dm = turn on and off direct messages to the bot  (Admin rights needed and Admins can do this always.)\
-/tools = turn on and off websearch module and image generation module\
-/test_websearch = simple Websearch test\
-/diagnose_websearch = more detailed websearch test.\
-</h4>
-
-<h4>
-This: https://github.com/jakobdylanc/llmcord
-
-With this: 
-koboldcpp/Qwen3-Coder-REAP-246B-A35B-MXFP4_MOE-00001-of-00007, koboldcpp/cerebras_GLM-4.5-Air-REAP-82B-A12B-IQ4_NL
-
-Made into this: [https://github.com/Neresco/llmcord_with_image_generation_and_websearch](https://github.com/Neresco/llmcord_with_image_generation_and_websearch)
-
-Can be tested here: [⁠mandurin-bot](https://discord.com/channels/849937185893384223/1423438997656572075)
-</h4>
-
-<h4 align="center">
 Key Improvements Made:
 
 1. Image Provider Switching
