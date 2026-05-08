@@ -451,6 +451,22 @@ async def image_providers_command(interaction: discord.Interaction, provider: st
     await interaction.response.send_message(output, ephemeral=True)
 
 
+@discord_bot.tree.command(name="reset_memory", description="Reset your conversation memory/history")
+async def reset_memory_command(interaction: discord.Interaction) -> None:
+    user_id = interaction.user.id
+    
+    nodes_to_remove = [
+        msg_id for msg_id, node in msg_nodes.items()
+        if node.parent_msg and node.parent_msg.author.id == user_id
+    ]
+    
+    for msg_id in nodes_to_remove:
+        msg_nodes.pop(msg_id, None)
+    
+    logging.info(f"Reset conversation memory for user ID: {user_id}, removed {len(nodes_to_remove)} nodes")
+    await interaction.response.send_message(f"✅ Your conversation memory has been reset. Removed {len(nodes_to_remove)} message nodes.", ephemeral=True)
+
+
 @discord_bot.tree.command(name="allow_dm", description="Toggle Direct Message functionality (Admin only)")
 async def allow_dm_command(interaction: discord.Interaction, enabled: bool) -> None:
     permissions = config.get("permissions", {
