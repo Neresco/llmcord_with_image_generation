@@ -46,6 +46,8 @@ llm_config = config.get("llm", {})
 image_queue = asyncio.Queue()
 image_results = {}
 queue_lock = asyncio.Lock()
+active_image_requests = {}
+queue_position_counter = 0
 
 msg_nodes = {}
 last_task_time = 0
@@ -111,10 +113,15 @@ class MsgNode:
 async def image_generation_worker():
     while True:
         try:
-            request_id, prompt, negative_prompt, provider_config, parameters, user_id = await image_queue.get()
+            request_id, prompt, negative_prompt, provider_config, parameters, user_id, interaction = await image_queue.get()
             
             async with queue_lock:
-                queue_position = image_queue.qsize() + 1
+                if request_id in active_image_requests:
+                    current_position = active_image_requests[request_id]["queue_position"]
+                else:
+                    current_position = 0
+            
+            logging.info(f"[Image Queue #{current_position}] Processing request {request_id[:8]} for user {user_id}")
             
             try:
                 image_data = await generate_image(prompt, negative_prompt, provider_config, parameters)
@@ -134,33 +141,33 @@ async def image_generation_worker():
                             f.write(image_bytes)
                         
                         image_results[request_id] = {"status": "success", "filepath": filepath}
-                        logging.info(f"Image saved successfully: {filepath}")
+                        logging.info(f"[Image Queue] Request {request_id[:8]} completed successfully: {filepath}")
                     except Exception as e:
-                        logging.exception(f"Error saving generated image: {e}")
-                        image_results[request_id] = {"status": "error", "error": str(e)}
+                        logging.exception(f"[Image Queue] Error saving generated image {request_id[:8]}: {e}")
+                        image_results[request_id] = {"status": "error", "error": f"Failed to save image: {str(e)}"}
                 else:
-                    image_results[request_id] = {"status": "error", "error": "Failed to generate image"}
+                    image_results[request_id] = {"status": "error", "error": "Image generation API returned no data"}
                     
             except Exception as e:
-                logging.exception(f"Error processing image generation: {e}")
-                image_results[request_id] = {"status": "error", "error": str(e)}
+                logging.exception(f"[Image Queue] Error processing image generation {request_id[:8]}: {e}")
+                image_results[request_id] = {"status": "error", "error": f"Generation failed: {str(e)}"}
             
             finally:
                 async with queue_lock:
-                    pass
+                    active_image_requests.pop(request_id, None)
                 image_queue.task_done()
                 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logging.exception(f"Unexpected error in image worker: {e}")
+            logging.exception(f"[Image Queue] Unexpected error in image worker: {e}")
 
 
 async def generate_image(prompt: str, negative_prompt: str, provider_config: dict, parameters: dict = None) -> Optional[str]:
     try:
         forge_url = provider_config.get("forge_url")
         if not forge_url:
-            logging.error("Forge URL not configured for image generation")
+            logging.error("[Image Gen] Forge URL not configured")
             return None
             
         default_params = provider_config.get("default_params", {})
@@ -201,32 +208,44 @@ async def generate_image(prompt: str, negative_prompt: str, provider_config: dic
         
         headers = {"Content-Type": "application/json"}
         
-        logging.info(f"Sending image generation request to {forge_url}")
+        timeout = provider_config.get("timeout", 720.0)
+        logging.info(f"[Image Gen] Sending request to {forge_url} | Timeout: {timeout}s | Model: {default_model}")
         
-        async with httpx.AsyncClient(timeout=provider_config.get("timeout", 720.0)) as client:
-            response = await client.post(
-                f"{forge_url}/sdapi/v1/txt2img",
-                json=payload,
-                headers=headers
-            )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                response = await client.post(
+                    f"{forge_url}/sdapi/v1/txt2img",
+                    json=payload,
+                    headers=headers
+                )
+            except httpx.TimeoutException as e:
+                logging.error(f"[Image Gen] Request timed out after {timeout}s: {e}")
+                return None
+            except httpx.ConnectError as e:
+                logging.error(f"[Image Gen] Connection failed to {forge_url}: {e}")
+                return None
+            except httpx.HTTPError as e:
+                logging.error(f"[Image Gen] HTTP error: {e}")
+                return None
             
             if response.status_code == 200:
                 try:
                     data = response.json()
                     if "images" in data and len(data["images"]) > 0:
+                        logging.info(f"[Image Gen] Successfully received image data ({len(data['images'][0])} bytes)")
                         return data["images"][0]
                     else:
-                        logging.error("No images returned from image generation")
+                        logging.error(f"[Image Gen] API returned empty images array. Response: {data}")
                         return None
                 except Exception as e:
-                    logging.exception(f"Error parsing JSON response: {e}")
+                    logging.exception(f"[Image Gen] JSON parsing error: {e}")
                     return None
             else:
-                logging.error(f"Image generation failed: {response.status_code} - {response.text}")
+                logging.error(f"[Image Gen] API error {response.status_code}: {response.text[:500]}")
                 return None
                 
     except Exception as e:
-        logging.exception(f"Error generating image: {e}")
+        logging.exception(f"[Image Gen] Unexpected error: {type(e).__name__}: {e}")
         return None
 
 
@@ -234,6 +253,8 @@ async def generate_image(prompt: str, negative_prompt: str, provider_config: dic
 async def image_command(interaction: discord.Interaction, 
                        prompt: str,
                        negative_prompt: Optional[str] = None) -> None:
+    global queue_position_counter
+    
     await interaction.response.defer(ephemeral=False)
     
     image_providers = llm_config.get("image_generator", {})
@@ -250,21 +271,33 @@ async def image_command(interaction: discord.Interaction,
     
     provider_config = actual_providers.get(current_image_provider or list(actual_providers.keys())[0], {})
     if not provider_config:
-        await interaction.followup.send(f"Image provider not found.", ephemeral=True)
+        await interaction.followup.send("Image provider not found.", ephemeral=True)
         return
     
     request_id = str(uuid.uuid4())
     
     async with queue_lock:
-        queue_position = image_queue.qsize() + 1
+        queue_position_counter += 1
+        assigned_position = queue_position_counter
+        
+        active_image_requests[request_id] = {
+            "queue_position": assigned_position,
+            "started_at": datetime.now(),
+            "prompt": prompt[:100],
+            "user_id": interaction.user.id,
+            "request_id": request_id
+        }
     
-    await image_queue.put((request_id, prompt, negative_prompt or "", provider_config, {}, interaction.user.id))
+    await image_queue.put((request_id, prompt, negative_prompt or "", provider_config, {}, interaction.user.id, interaction))
     
-    queue_msg = f"Your image generation request has been added to the queue. You are at position **#{queue_position}**."
+    queue_msg = f"🖼️ Image request added to queue. Position: **#{assigned_position}** | Request ID: `{request_id[:8]}`"
     await interaction.followup.send(queue_msg, ephemeral=True)
+    
+    logging.info(f"[Image Command] User {interaction.user.id} queued image: {prompt[:50]}... (Request: {request_id[:8]}, Position: #{assigned_position})")
     
     start_time = datetime.now()
     timeout = 1200
+    last_status_update = start_time
     
     while (datetime.now() - start_time).seconds < timeout:
         if request_id in image_results:
@@ -275,9 +308,10 @@ async def image_command(interaction: discord.Interaction,
                     filepath = result["filepath"]
                     file = discord.File(filepath, filename=os.path.basename(filepath))
                     
-                    embed = discord.Embed(title=f"Generated Image for: {prompt[:50]}...", color=EMBED_COLOR_COMPLETE)
+                    embed = discord.Embed(title=f"✅ Generated Image", description=f"**Prompt:** {prompt[:100]}{'...' if len(prompt) > 100 else ''}", color=EMBED_COLOR_COMPLETE)
                     if negative_prompt:
-                        embed.description = f"Negative prompt: {negative_prompt[:50]}..."
+                        embed.add_field(name="Negative Prompt", value=negative_prompt[:100], inline=False)
+                    embed.set_image(url=f"attachment://{os.path.basename(filepath)}")
                     
                     await interaction.followup.send(embed=embed, file=file)
                     
@@ -286,14 +320,24 @@ async def image_command(interaction: discord.Interaction,
                     except Exception as e:
                         logging.warning(f"Could not delete temporary image file {filepath}: {e}")
                         
+                except discord.HTTPException as e:
+                    logging.exception(f"Error sending generated image: {e.status} - {e.text}")
+                    await interaction.followup.send(f"❌ Failed to send image: {e.status} {e.text}", ephemeral=True)
                 except Exception as e:
-                    logging.exception(f"Error sending generated image: {e}")
-                    await interaction.followup.send("Failed to send generated image.", ephemeral=True)
+                    logging.exception(f"Unexpected error sending image: {e}")
+                    await interaction.followup.send(f"❌ Unexpected error: {type(e).__name__}", ephemeral=True)
             else:
                 error_msg = result.get("error", "Unknown error")
-                await interaction.followup.send(f"Failed to generate image: {error_msg}", ephemeral=True)
+                await interaction.followup.send(f"❌ Image generation failed: {error_msg}", ephemeral=True)
             
             return
+        
+        elapsed = (datetime.now() - start_time).seconds
+        if elapsed > 30 and (datetime.now() - last_status_update).seconds > 60:
+            async with queue_lock:
+                current_pos = active_image_requests[request_id]["queue_position"] if request_id in active_image_requests else 0
+            await interaction.followup.send(f"⏳ Still processing... Position: #{current_pos} | Elapsed: {elapsed}s", ephemeral=True)
+            last_status_update = datetime.now()
         
         await asyncio.sleep(5)
     
@@ -308,6 +352,8 @@ async def image_advanced_command(interaction: discord.Interaction,
                                 cfg_scale: Optional[float] = None,
                                 width: Optional[int] = None,
                                 height: Optional[int] = None) -> None:
+    global queue_position_counter
+    
     await interaction.response.defer(ephemeral=False)
     
     image_providers = llm_config.get("image_generator", {})
@@ -324,7 +370,7 @@ async def image_advanced_command(interaction: discord.Interaction,
     
     provider_config = actual_providers.get(current_image_provider or list(actual_providers.keys())[0], {})
     if not provider_config:
-        await interaction.followup.send(f"Image provider not found.", ephemeral=True)
+        await interaction.followup.send("Image provider not found.", ephemeral=True)
         return
     
     parameters = {}
@@ -340,15 +386,25 @@ async def image_advanced_command(interaction: discord.Interaction,
     request_id = str(uuid.uuid4())
     
     async with queue_lock:
-        queue_position = image_queue.qsize() + 1
+        queue_position_counter += 1
+        assigned_position = queue_position_counter
+        
+        active_image_requests[request_id] = {
+            "queue_position": assigned_position,
+            "started_at": datetime.now(),
+            "prompt": prompt[:100],
+            "user_id": interaction.user.id,
+            "request_id": request_id
+        }
     
-    await image_queue.put((request_id, prompt, negative_prompt or "", provider_config, parameters, interaction.user.id))
+    await image_queue.put((request_id, prompt, negative_prompt or "", provider_config, parameters, interaction.user.id, interaction))
     
-    queue_msg = f"Your image generation request has been added to the queue. You are at position **#{queue_position}**."
+    queue_msg = f"🖼️ Image request added to queue. Position: **#{assigned_position}** | Request ID: `{request_id[:8]}`"
     await interaction.followup.send(queue_msg, ephemeral=True)
     
     start_time = datetime.now()
     timeout = 1200
+    last_status_update = start_time
     
     while (datetime.now() - start_time).seconds < timeout:
         if request_id in image_results:
@@ -359,9 +415,11 @@ async def image_advanced_command(interaction: discord.Interaction,
                     filepath = result["filepath"]
                     file = discord.File(filepath, filename=os.path.basename(filepath))
                     
-                    embed = discord.Embed(title=f"Generated Image for: {prompt[:50]}...", color=EMBED_COLOR_COMPLETE)
+                    embed = discord.Embed(title=f"✅ Generated Image", description=f"**Prompt:** {prompt[:100]}{'...' if len(prompt) > 100 else ''}", color=EMBED_COLOR_COMPLETE)
+                    embed.add_field(name="Steps", value=steps or provider_config.get("default_params", {}).get("steps", 40), inline=True)
+                    embed.add_field(name="Size", value=f"{width or provider_config.get('default_size', '768x768')}", inline=True)
                     if negative_prompt:
-                        embed.description = f"Negative prompt: {negative_prompt[:50]}..."
+                        embed.add_field(name="Negative Prompt", value=negative_prompt[:50], inline=False)
                     
                     await interaction.followup.send(embed=embed, file=file)
                     
@@ -370,18 +428,98 @@ async def image_advanced_command(interaction: discord.Interaction,
                     except Exception as e:
                         logging.warning(f"Could not delete temporary image file {filepath}: {e}")
                         
+                except discord.HTTPException as e:
+                    logging.exception(f"Error sending generated image: {e.status} - {e.text}")
+                    await interaction.followup.send(f"❌ Failed to send image: {e.status} {e.text}", ephemeral=True)
                 except Exception as e:
-                    logging.exception(f"Error sending generated image: {e}")
-                    await interaction.followup.send("Failed to send generated image.", ephemeral=True)
+                    logging.exception(f"Unexpected error sending image: {e}")
+                    await interaction.followup.send(f"❌ Unexpected error: {type(e).__name__}", ephemeral=True)
             else:
                 error_msg = result.get("error", "Unknown error")
-                await interaction.followup.send(f"Failed to generate image: {error_msg}", ephemeral=True)
+                await interaction.followup.send(f"❌ Image generation failed: {error_msg}", ephemeral=True)
             
             return
         
+        elapsed = (datetime.now() - start_time).seconds
+        if elapsed > 30 and (datetime.now() - last_status_update).seconds > 60:
+            async with queue_lock:
+                current_pos = active_image_requests[request_id]["queue_position"] if request_id in active_image_requests else 0
+            await interaction.followup.send(f"⏳ Still processing... Position: #{current_pos} | Elapsed: {elapsed}s", ephemeral=True)
+            last_status_update = datetime.now()
+        
         await asyncio.sleep(5)
     
-    await interaction.followup.send("Image generation timed out after 20 minutes.", ephemeral=True)
+    await interaction.followup.send("⏱️ Image generation timed out after 20 minutes.", ephemeral=True)
+
+
+@discord_bot.tree.command(name="queue_status", description="Check your image generation queue status")
+async def queue_status_command(interaction: discord.Interaction) -> None:
+    user_id = interaction.user.id
+    
+    async with queue_lock:
+        user_requests = [
+            (req_id, info) for req_id, info in active_image_requests.items()
+            if info.get("user_id") == user_id
+        ]
+        
+        queue_size = image_queue.qsize()
+    
+    if not user_requests:
+        await interaction.response.send_message("📭 You have no active image generation requests.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(title="🖼️ Your Image Queue Status", color=EMBED_COLOR_INCOMPLETE)
+    
+    for req_id, info in user_requests:
+        position = info["queue_position"]
+        elapsed = (datetime.now() - info["started_at"]).seconds
+        prompt = info.get("prompt", "Unknown")[:50]
+        
+        embed.add_field(
+            name=f"Request `{req_id[:8]}`",
+            value=f"Position: #{position} | Elapsed: {elapsed}s\nPrompt: {prompt}",
+            inline=False
+        )
+    
+    embed.set_footer(text=f"Total queue size: {queue_size} requests")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@discord_bot.tree.command(name="clear_queue", description="Clear all image generation requests (Admin only)")
+async def clear_queue_command(interaction: discord.Interaction) -> None:
+    global queue_position_counter
+    
+    permissions = config.get("permissions", {
+        "users": {
+            "admin_ids": config.get("admin_user_ids", [])
+        }
+    })
+    
+    user_is_admin = interaction.user.id in permissions["users"]["admin_ids"]
+    
+    if not user_is_admin:
+        await interaction.response.send_message("🔒 Only administrators can use this command.", ephemeral=True)
+        return
+    
+    async with queue_lock:
+        queue_size = image_queue.qsize()
+        active_count = len(active_image_requests)
+        
+        while not image_queue.empty():
+            try:
+                await image_queue.get_nowait()
+                image_queue.task_done()
+            except:
+                break
+        
+        active_image_requests.clear()
+        queue_position_counter = 0
+    
+    logging.info(f"[Admin] Queue cleared by user {interaction.user.id}: {queue_size} pending, {active_count} active")
+    await interaction.response.send_message(
+        f"✅ Queue cleared! Removed {queue_size} pending and {active_count} active requests. Counter reset.", 
+        ephemeral=True
+    )
 
 
 @discord_bot.tree.command(name="providers", description="Switch between different providers/endpoints")
@@ -584,7 +722,7 @@ async def on_ready() -> None:
 
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
-    global last_task_time, current_provider, current_model, current_image_provider
+    global last_task_time, current_provider, current_model, current_image_provider, queue_position_counter
 
     is_dm = new_msg.channel.type == discord.ChannelType.private
 
@@ -864,20 +1002,31 @@ async def on_message(new_msg: discord.Message) -> None:
             provider_config = actual_providers.get(current_image_provider or list(actual_providers.keys())[0], {})
             if not provider_config:
                 logging.error(f"Image provider not found for trigger")
+                await new_msg.reply("❌ Image generation is not properly configured.", mention_author=False)
                 return
             
             request_id = str(uuid.uuid4())
             
             async with queue_lock:
-                queue_position = image_queue.qsize() + 1
+                queue_position_counter += 1
+                assigned_position = queue_position_counter
+                
+                active_image_requests[request_id] = {
+                    "queue_position": assigned_position,
+                    "started_at": datetime.now(),
+                    "prompt": prompt_text[:100],
+                    "user_id": new_msg.author.id,
+                    "request_id": request_id
+                }
             
-            await image_queue.put((request_id, prompt_text, "", provider_config, {}, new_msg.author.id))
+            await image_queue.put((request_id, prompt_text, "", provider_config, {}, new_msg.author.id, None))
             
-            queue_msg = f"You are at position **#{queue_position}** in the image generation queue."
+            queue_msg = f"🖼️ Image request queued. Position: **#{assigned_position}** | Request: `{request_id[:8]}`"
             await new_msg.reply(queue_msg, mention_author=False)
             
             start_time = datetime.now()
             timeout = 1200
+            last_status_update = start_time
             
             while (datetime.now() - start_time).seconds < timeout:
                 if request_id in image_results:
@@ -888,7 +1037,7 @@ async def on_message(new_msg: discord.Message) -> None:
                             filepath = result["filepath"]
                             file = discord.File(filepath, filename=os.path.basename(filepath))
                             
-                            embed = discord.Embed(title=f"Generated Image for: {prompt_text[:50]}...", color=EMBED_COLOR_COMPLETE)
+                            embed = discord.Embed(title=f"✅ Generated Image", description=f"**Prompt:** {prompt_text[:100]}{'...' if len(prompt_text) > 100 else ''}", color=EMBED_COLOR_COMPLETE)
                             
                             await new_msg.reply(embed=embed, file=file, mention_author=False)
                             
@@ -897,18 +1046,28 @@ async def on_message(new_msg: discord.Message) -> None:
                             except Exception as e:
                                 logging.warning(f"Could not delete temporary image file {filepath}: {e}")
                                 
+                        except discord.HTTPException as e:
+                            logging.exception(f"Error sending generated image: {e.status} - {e.text}")
+                            await new_msg.reply(f"❌ Failed to send image: Discord API error {e.status}", mention_author=False)
                         except Exception as e:
-                            logging.exception(f"Error sending generated image: {e}")
-                            await new_msg.reply("Failed to send generated image.", mention_author=False)
+                            logging.exception(f"Unexpected error sending image: {e}")
+                            await new_msg.reply(f"❌ Error: {type(e).__name__}", mention_author=False)
                     else:
                         error_msg = result.get("error", "Unknown error")
-                        await new_msg.reply(f"Failed to generate image: {error_msg}", mention_author=False)
+                        await new_msg.reply(f"❌ Image generation failed: {error_msg}", mention_author=False)
                     
                     return
                 
+                elapsed = (datetime.now() - start_time).seconds
+                if elapsed > 30 and (datetime.now() - last_status_update).seconds > 60:
+                    async with queue_lock:
+                        current_pos = active_image_requests[request_id]["queue_position"] if request_id in active_image_requests else 0
+                    await new_msg.reply(f"⏳ Processing... Position: #{current_pos} | Elapsed: {elapsed}s", mention_author=False)
+                    last_status_update = datetime.now()
+                
                 await asyncio.sleep(5)
             
-            await new_msg.reply("Image generation timed out after 20 minutes.", mention_author=False)
+            await new_msg.reply("⏱️ Image generation timed out after 20 minutes.", mention_author=False)
             return
 
     if "web_search" in llm_config.get("active_tools", []):
