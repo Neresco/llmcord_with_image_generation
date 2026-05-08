@@ -1062,7 +1062,7 @@ async def on_message(new_msg: discord.Message) -> None:
                 if elapsed > 30 and (datetime.now() - last_status_update).seconds > 60:
                     async with queue_lock:
                         current_pos = active_image_requests[request_id]["queue_position"] if request_id in active_image_requests else 0
-                    await new_msg.reply(f"⏳ Processing... Position: #{current_pos} | Elapsed: {elapsed}s", mention_author=False)
+                    await new_msg.reply(f"⏳ Processing... Position: #{current_pos} | Elapsed: {elapsed}s", mention_author=True)
                     last_status_update = datetime.now()
                 
                 await asyncio.sleep(5)
