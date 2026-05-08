@@ -118,6 +118,18 @@ llm:
 6. **Flow**: Never leave a sentence unfinished; always complete thoughts fully.
 7. **Readability**: Format the response in for humans easy to read paragraphs.'
   
+    # Typing indicator configuration
+  # Controls how often the bot sends typing indicators to avoid rate limits
+  typing:
+    # Interval in seconds between typing indicator calls
+    # Discord's typing indicator lasts ~10 seconds, so 5-10 seconds is recommended
+    interval_seconds: 10
+    
+    # Maximum number of typing indicator calls per message
+    # Set to 1 for minimal rate limit risk, higher for longer messages
+    # 0 to disable typing indicators completely
+    max_calls_per_message: 3
+  
   # Reasoning/Thinking configuration
   # Use these settings to control how thinking/reasoning content is handled
   reasoning:

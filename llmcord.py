@@ -1145,6 +1145,10 @@ async def on_message(new_msg: discord.Message) -> None:
         max_message_length = 4096 - len(STREAMING_INDICATOR)
         embed = discord.Embed.from_dict(dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]))
 
+    typing_config = llm_config.get("typing", {})
+    typing_interval = typing_config.get("interval_seconds", 10)
+    max_typing_calls = typing_config.get("max_calls_per_message", 3)
+
     async def reply_helper(**reply_kwargs) -> None:
         reply_target = new_msg if not response_msgs else response_msgs[-1]
         response_msg = await reply_target.reply(**reply_kwargs)
@@ -1153,9 +1157,22 @@ async def on_message(new_msg: discord.Message) -> None:
         msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
         await msg_nodes[response_msg.id].lock.acquire()
 
+    typing_call_count = 0
+
+    async def send_typing_if_allowed() -> None:
+        nonlocal typing_call_count
+        if max_typing_calls > 0 and typing_call_count < max_typing_calls:
+            try:
+                await new_msg.channel.trigger_typing()
+                typing_call_count += 1
+            except:
+                pass
+
     try:
-        async with new_msg.channel.typing():
-            async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
+        await send_typing_if_allowed()
+        last_typing_time = datetime.now().timestamp()
+
+        async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
                 if finish_reason is not None:
                     break
 
@@ -1177,6 +1194,11 @@ async def on_message(new_msg: discord.Message) -> None:
 
                 response_contents[-1] += new_content
 
+                current_time = datetime.now().timestamp()
+                if typing_interval > 0 and (current_time - last_typing_time) >= typing_interval:
+                    await send_typing_if_allowed()
+                    last_typing_time = current_time
+
                 if not use_plain_responses:
                     time_delta = datetime.now().timestamp() - last_task_time
 
@@ -1197,9 +1219,9 @@ async def on_message(new_msg: discord.Message) -> None:
 
                         last_task_time = datetime.now().timestamp()
 
-            if use_plain_responses:
-                for content in response_contents:
-                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+        if use_plain_responses:
+            for content in response_contents:
+                await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
 
     except Exception:
         logging.exception("Error while generating response")
