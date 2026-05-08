@@ -3,3 +3,4 @@ httpx
 openai
 pyyaml
 beautifulsoup4
+jinja2

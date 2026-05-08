@@ -1,710 +1,113 @@
-# llmcord.py (with reasoning display options and vision capabilities preserved)
+import asyncio
 import os
 import uuid
-import logging
-import asyncio
-import httpx
-import yaml
-import urllib.parse
-from datetime import datetime
+from base64 import b64encode
 from dataclasses import dataclass, field
-from typing import Optional, Any, Literal, List
-from base64 import b64decode, b64encode
-import discord
-from discord.app_commands import Choice as AppChoice
-from discord.ext import commands
-from openai import AsyncOpenAI
-from collections import OrderedDict
+from datetime import datetime
+import logging
+from typing import Any, Literal, Optional
 import re
 
-# Logging configuration
+import discord
+from discord.app_commands import Choice
+from discord.ext import commands
+from discord.ui import LayoutView, TextDisplay
+import httpx
+from openai import AsyncOpenAI
+import yaml
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot.log')
-    ]
+    format="%(asctime)s %(levelname)s: %(message)s",
 )
-logger = logging.getLogger(__name__)
 
-# Constants
-EMBED_COLOR_INCOMPLETE = 0x3498db
-EMBED_COLOR_COMPLETE = 0x2ecc71
-EMBED_COLOR_ERROR = 0xe74c3c
-STREAMING_INDICATOR = "..."
-EDIT_DELAY_SECONDS = 0.5
-MAX_MESSAGE_NODES = 100
-VISION_MODEL_TAGS = ["", "vision", "gpt-4", "claude"]
-PROVIDERS_SUPPORTING_USERNAMES = ["", "openai", "anthropic", "gemini"]
+VISION_MODEL_TAGS = ("claude", "gemini", "gemma", "gpt-4", "gpt-5", "grok-4", "llama", "llava", "mistral", "o3", "o4", "vision", "vl", "qwen", "")
 
-# Global variables
-image_queue = asyncio.Queue()
-image_results = {}
-image_queue_positions = {}
-queue_lock = asyncio.Lock()
+EMBED_COLOR_COMPLETE = discord.Color.dark_green()
+EMBED_COLOR_INCOMPLETE = discord.Color.orange()
+EMBED_COLOR_ERROR = discord.Color.red()
+
+STREAMING_INDICATOR = " ⚪"
+EDIT_DELAY_SECONDS = 1
+
+MAX_MESSAGE_NODES = 500
 IMAGE_STORAGE_FOLDER = "generated_images"
 os.makedirs(IMAGE_STORAGE_FOLDER, exist_ok=True)
 
-# Config handling
-def get_config():
-    try:
-        with open("config.yaml", "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        return {}
+
+def get_config(filename: str = "config.yaml") -> dict[str, Any]:
+    with open(filename, encoding="utf-8") as file:
+        return yaml.safe_load(file) or {}
+
 
 config = get_config()
-if "llm" not in config:
-    config["llm"] = {}
-if "models" not in config:
-    llm_model = config.get("llm", {}).get("model")
-    if llm_model:
-        config["models"] = {llm_model: {}}
-    else:
-        config["models"] = {}
+llm_config = config.get("llm", {})
 
-if "permissions" not in config:
-    config["permissions"] = {
-        "users": {
-            "admin_ids": config.get("admin_user_ids", []),
-            "allowed_ids": [],
-            "blocked_ids": []
-        },
-        "roles": {
-            "allowed_ids": [],
-            "blocked_ids": []
-        },
-        "channels": {
-            "allowed_ids": config.get("allowed_channel_ids", []),
-            "blocked_ids": []
-        }
-    }
+image_queue = asyncio.Queue()
+image_results = {}
+queue_lock = asyncio.Lock()
 
-current_provider = "Kobold_Server"
-current_model = None
-current_image_provider = "forge_1"
 msg_nodes = {}
 last_task_time = 0
 
-# Bot setup
+current_provider = None
+current_model = None
+current_image_provider = None
+
 intents = discord.Intents.default()
 intents.message_content = True
-activity = discord.CustomActivity(name=(config.get("status_message") or "Original: github.com/jakobdylanc/llmcord")[:128])
+activity = discord.CustomActivity(name=(config.get("status_message") or "github.com/jakobdylanc/llmcord")[:128])
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
+
 httpx_client = httpx.AsyncClient()
 
-# Reasoning processing functions
-def extract_reasoning(content: str, start_tag: str, end_tag: str) -> tuple[str, Optional[str]]:
-    """Extract reasoning section from content using configured tags"""
-    reasoning_start = content.find(start_tag)
-    if reasoning_start == -1:
-        return content, None
-    
-    reasoning_end = content.find(end_tag, reasoning_start)
-    if reasoning_end == -1:
-        return content, None
-    
-    # Extract the reasoning content (without the tags)
-    reasoning_content = content[reasoning_start + len(start_tag):reasoning_end].strip()
-    
-    # Create clean content without reasoning section
-    clean_content = (
-        content[:reasoning_start].rstrip() +
-        content[reasoning_end + len(end_tag):].lstrip()
-    )
-    
-    return clean_content, reasoning_content
 
-def strip_all_thinking_tags(content: str, thinking_tags: List[str] = None) -> str:
+def strip_jinja_templates(content: str) -> str:
+    if not content:
+        return content
+    
+    content = re.sub(r'\{\{\s*.*?\s*\}\}', '', content)
+    content = re.sub(r'\{%\s*.*?\s*%\}', '', content, flags=re.DOTALL)
+    content = re.sub(r'\{#.*?#\}', '', content, flags=re.DOTALL)
+    content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)
+    
+    return content.strip()
+
+
+def parse_reasoning_effort(reasoning_effort: str, max_tokens: int = 4096) -> int:
     """
-    Remove all thinking/reasoning tags and their content from the response.
-    Uses regex for robust pattern matching across multiple tag variations.
+    Parse reasoning_effort string to reasoning_budget integer for koboldcpp API.
     
-    Args:
-        content: The text content to clean
-        thinking_tags: List of tag pairs to strip. If None, uses common defaults.
-    
-    Returns:
-        Cleaned content with all thinking blocks removed
+    Supported values: high, medium, low, minimal, none
+    Returns: reasoning_budget as token count (-1 for unrestricted)
     """
-    if thinking_tags is None:
-        # Default common thinking tag patterns - covers KoboldCPP, llama.cpp, Ollama, etc.
-        thinking_tags = [
-            "<thinking>",
-            "<think>",
-            "<THINKING>",
-            "<reason>",
-            "<reasoning>",
-            "<think>",
-            "<|begin_of_thought|>",
-            "<|end_of_thought|>",
-            "<thought>",
-            "<|begin_thought|>",
-            "<|end_thought|>",
-            "",
-            "</think>",
-            "<|start_thinking|>",
-            "<|end_thinking|>",
-        ]
+    reasoning_effort = reasoning_effort.strip().lower() if reasoning_effort else ''
     
-    clean_content = content
-    
-    for tag in thinking_tags:
-        # Escape special regex characters in the tag
-        escaped_tag = re.escape(tag)
-        
-        # Create pattern to match opening tag, content, and closing tag
-        # Handle both self-closing tags and paired tags
-        closing_tag = tag.replace("<", "</") if tag.startswith("<") else f"</{tag}>"
-        escaped_closing = re.escape(closing_tag)
-        
-        # Pattern for paired tags: <tag>content</tag>
-        pattern = f"{escaped_tag}.*?{escaped_closing}"
-        
-        # Remove all matches (case-insensitive for flexibility)
-        clean_content = re.sub(pattern, "", clean_content, flags=re.DOTALL | re.IGNORECASE)
-    
-    # Also handle empty or malformed tags that might slip through
-    # Remove any standalone opening or closing tags
-    for tag in thinking_tags:
-        escaped_tag = re.escape(tag)
-        closing_tag = tag.replace("<", "</") if tag.startswith("<") else f"</{tag}>"
-        escaped_closing = re.escape(closing_tag)
-        
-        # Remove orphan tags
-        clean_content = re.sub(escaped_tag, "", clean_content, flags=re.IGNORECASE)
-        clean_content = re.sub(escaped_closing, "", clean_content, flags=re.IGNORECASE)
-    
-    # Clean up extra whitespace left behind
-    clean_content = re.sub(r'\n\s*\n\s*\n', '\n\n', clean_content)
-    clean_content = clean_content.strip()
-    
-    return clean_content
+    if reasoning_effort == "none":
+        return 0
+    elif reasoning_effort == "minimal":
+        return int(0.1 * max_tokens)
+    elif reasoning_effort == "low":
+        return int(0.25 * max_tokens)
+    elif reasoning_effort == "medium":
+        return int(0.5 * max_tokens)
+    elif reasoning_effort == "high":
+        return int(0.75 * max_tokens)
+    else:
+        return -1
 
-def create_thinking_buffer_processor(thinking_tags: List[str] = None):
-    """
-    Create a closure that maintains state for streaming thinking tag removal.
-    This buffers partial tags during streaming to prevent them from being displayed.
-    
-    Returns:
-        A function that processes streaming chunks and returns clean content
-    """
-    if thinking_tags is None:
-        # Default common thinking tag patterns - covers Qwen3.5, KoboldCPP, llama.cpp, Ollama, etc.
-        thinking_tags = [
-            "<think>",
-            "</think>",
-            "<thinking>",
-            "</thinking>",
-            "<THINKING>",
-            "</THINKING>",
-            "<reason>",
-            "</reason>",
-            "<reasoning>",
-            "</reasoning>",
-            "<|begin_of_thought|>",
-            "<|end_of_thought|>",
-            "<thought>",
-            "<|begin_thought|>",
-            "<|end_thought|>",
-            "<|start_thinking|>",
-            "<|end_thinking|>",
-        ]
-    
-    # Build patterns for opening and closing tags
-    opening_patterns = []
-    closing_patterns = []
-    
-    for tag in thinking_tags:
-        opening_patterns.append(re.escape(tag))
-        closing_tag = tag.replace("<", "</") if tag.startswith("<") else f"</{tag}>"
-        closing_patterns.append(re.escape(closing_tag))
-    
-    # State buffers
-    buffer = ""
-    inside_thinking = False
-    
-    def process_chunk(chunk: str) -> str:
-        nonlocal buffer, inside_thinking
-        
-        # Append new chunk to buffer
-        buffer += chunk
-        
-        # Check if we're entering thinking mode
-        for pattern in opening_patterns:
-            if re.search(pattern, buffer, re.IGNORECASE):
-                inside_thinking = True
-                break
-        
-        # If we're not inside thinking, return the buffer and clear it
-        if not inside_thinking:
-            result = buffer
-            buffer = ""
-            return result
-        
-        # Check if thinking mode is ending
-        for pattern in closing_patterns:
-            if re.search(pattern, buffer, re.IGNORECASE):
-                # Found closing tag, extract content after it
-                match = re.search(pattern, buffer, re.IGNORECASE | re.DOTALL)
-                if match:
-                    buffer = buffer[match.end():]
-                    inside_thinking = False
-                break
-        
-        # If still inside thinking, return empty string (buffer holds the thinking content)
-        if inside_thinking:
-            return ""
-        
-        # Just exited thinking, return any content after the closing tag
-        result = buffer
-        buffer = ""
-        return result
-    
-    def reset():
-        nonlocal buffer, inside_thinking
-        buffer = ""
-        inside_thinking = False
-    
-    return process_chunk, reset
-
-def process_reasoning_content(
-    content: str, 
-    reasoning_format: str,
-    start_tag: str,
-    end_tag: str
-) -> tuple[str, Optional[str], bool]:
-    """
-    Process content to handle reasoning sections based on configuration
-    Returns: (processed_content, reasoning_content, has_reasoning)
-    """
-    clean_content, reasoning_content = extract_reasoning(content, start_tag, end_tag)
-    
-    if not reasoning_content:
-        return content, None, False
-    
-    if reasoning_format == "spoiler":
-        # Replace with spoiler format
-        spoiler_content = f"> ||{reasoning_content}||\n\n"
-        return clean_content, reasoning_content, True
-    elif reasoning_format == "separate":
-        # Just remove the reasoning section but keep it for separate message
-        return clean_content, reasoning_content, True
-    else:  # "none" - completely remove reasoning
-        return clean_content, None, True
-
-# Web search functions
-async def web_search(query: str) -> dict:
-    base_url = config["llm"]["web_search"]["search_url"]
-    max_results = config["llm"]["web_search"].get("max_results", 5)
-    max_images_per_result = config["llm"]["web_search"].get("max_images_per_result", 2)
-    timeout = config["llm"]["web_search"].get("timeout", 30)
-    
-    try:
-        params = {"q": query, "format": "json"}
-        response = await httpx_client.get(base_url, params=params, timeout=timeout)
-        content_type = response.headers.get('content-type', '')
-        
-        if 'application/json' in content_type:
-            try:
-                data = response.json()
-                results = []
-                for result in data.get("results", [])[:max_results]:
-                    basic_result = {
-                        "title": result.get("title", ""),
-                        "url": result.get("url", ""),
-                        "content": result.get("content", "")[:200] + "..." if len(result.get("content", "")) > 200 else result.get("content", ""),
-                        "images": [],
-                        "source": result.get("source", ""),
-                        "category": result.get("category", ""),
-                        "published_date": result.get("published_date", "")
-                    }
-                    enhanced_content = await extract_enhanced_content(basic_result["url"], basic_result["content"])
-                    basic_result["enhanced_content"] = enhanced_content or {}
-                    results.append(basic_result)
-                
-                for i, result in enumerate(results):
-                    try:
-                        images = await extract_images_from_result(result["url"], max_images_per_result)
-                        result["images"] = images
-                        parsed_url = urllib.parse.urlparse(result["url"])
-                        result["domain"] = parsed_url.netloc
-                    except Exception as e:
-                        logger.warning(f"Error extracting images for result {i}: {e}")
-                        continue
-                
-                return {"success": True, "results": results}
-            except Exception as e:
-                logger.warning(f"JSON parsing failed: {e}")
-                pass
-        
-        logger.warning(f"Got non-JSON response. Content-Type: {content_type}")
-        logger.warning(f"Response preview: {response.text[:500]}")
-        
-    except Exception as e:
-        logger.info(f"JSON API failed ({str(e)}), trying HTML parsing...")
-    
-    # HTML parsing fallback
-    try:
-        from bs4 import BeautifulSoup
-        params = {"q": query}
-        response = await httpx_client.get(base_url, params=params, timeout=timeout)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        with open('/tmp/searxng_response.html', 'w', encoding='utf-8') as f:
-            f.write(soup.prettify())
-        
-        results = []
-        result_selectors = ['.result', '.result-item', '.search-result', '.engine_item', '.result-group']
-        title_selectors = ['.title a', '.result h3 a', '.result-title a', '.result a', 'h3 a', '.result-title', '.title']
-        content_selectors = ['.content', '.result .description', '.result-content', '.snippet', '.result p', '.result-excerpt', '.result-text']
-        image_selectors = ['.result img', '.result-item img', '.search-result img', '.engine_item img', '.thumbnail img', '.image img', 'img', '.result picture img', '.result figure img', '.media img', '.result-image img', '.result-thumbnail img', '.result-image-container img']
-        
-        result_containers = []
-        for selector in result_selectors:
-            found = soup.select(selector)
-            if found:
-                result_containers = found
-                logger.info(f"Found {len(found)} results using selector: {selector}")
-                break
-                
-        if not result_containers:
-            logger.error("Could not find any search result containers")
-            return {"success": False, "error": "No search results found"}
-            
-        total_images_found = 0
-        for container in result_containers[:max_results]:
-            title = ""
-            url = ""
-            for title_selector in title_selectors:
-                title_elem = container.select_one(title_selector)
-                if title_elem:
-                    title = title_elem.get_text(strip=True)
-                    url = title_elem.get('href', '')
-                    if url and not url.startswith(('http://', 'https://')):
-                        parsed_base = urllib.parse.urlparse(base_url)
-                        base = f"{parsed_base.scheme}://{parsed_base.netloc}"
-                        url = f"{base}{url}" if url.startswith('/') else f"{base}/{url}"
-                    break
-                    
-            content = ""
-            for content_selector in content_selectors:
-                content_elem = container.select_one(content_selector)
-                if content_elem:
-                    content = content_elem.get_text(strip=True)[:200] + "..." if len(content_elem.get_text(strip=True)) > 200 else content_elem.get_text(strip=True)
-                    break
-                    
-            source = ""
-            category = ""
-            published_date = ""
-            
-            source_selectors = ['.source', '.site', '.domain', '.meta-source']
-            for sel in source_selectors:
-                source_elem = container.select_one(sel)
-                if source_elem:
-                    source = source_elem.get_text(strip=True)
-                    break
-                    
-            category_selectors = ['.category', '.type', '.result-category']
-            for sel in category_selectors:
-                cat_elem = container.select_one(sel)
-                if cat_elem:
-                    category = cat_elem.get_text(strip=True)
-                    break
-                    
-            date_selectors = ['.date', '.published', '.timestamp', '.time']
-            for sel in date_selectors:
-                date_elem = container.select_one(sel)
-                if date_elem:
-                    published_date = date_elem.get_text(strip=True)
-                    break
-            
-            enhanced_content = await extract_enhanced_content(url, content)
-            
-            images = []
-            for image_selector in image_selectors:
-                image_elems = container.select(image_selector)
-                if image_elems:
-                    logger.debug(f"Found {len(image_elems)} images with selector: {image_selector}")
-                    break
-            
-            if not images:
-                image_links = container.select('a[href*=".jpg"], a[href*=".jpeg"], a[href*=".png"], a[href*=".gif"]')
-                for link in image_links[:max_images_per_result]:
-                    img_url = link.get('href', '')
-                    if img_url and img_url.startswith(('http://', 'https://')):
-                        images.append({
-                            "url": img_url,
-                            "alt": link.get('title', link.get('alt', ''))
-                        })
-            
-            total_images_found += len(images)
-            
-            if title and url:
-                result = {
-                    "title": title,
-                    "url": url,
-                    "content": content,
-                    "enhanced_content": enhanced_content or {},
-                    "images": images,
-                    "source": source,
-                    "category": category,
-                    "published_date": published_date,
-                    "domain": urllib.parse.urlparse(url).netloc if url else ""
-                }
-                results.append(result)
-                
-        if results:
-            logger.info(f"Successfully parsed {len(results)} results from HTML with {total_images_found} images")
-            return {"success": True, "results": results}
-        else:
-            logger.error("Found containers but no results could be extracted")
-            return {"success": False, "error": "Failed to extract search results from HTML"}
-            
-    except Exception as e:
-        logger.exception(f"HTML parsing failed: {e}")
-    
-    return {
-        "success": False, 
-        "error": "Web search endpoint is not accessible or does not return valid data."
-    }
-
-async def extract_enhanced_content(url: str, fallback_content: str) -> dict:
-    if not url:
-        return {
-            "summary": fallback_content,
-            "key_points": [],
-            "main_content": "",
-            "entities": [],
-            "keywords": []
-        }
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            })
-            
-            if response.status_code == 200:
-                from bs4 import BeautifulSoup
-                
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                for script in soup(["script", "style"]):
-                    script.decompose()
-                
-                main_content = ""
-                content_selectors = ['main', '.content', '.article', '.post', '.entry-content', '.post-content', '.main-content', '.body', '.text']
-                
-                for selector in content_selectors:
-                    content_elem = soup.select_one(selector)
-                    if content_elem:
-                        main_content = content_elem.get_text(strip=True)
-                        if len(main_content) > 100:
-                            break
-                
-                if not main_content:
-                    body = soup.find('body')
-                    if body:
-                        main_content = body.get_text(strip=True)
-                
-                key_points = []
-                if main_content:
-                    paragraphs = soup.find_all('p')
-                    for i, p in enumerate(paragraphs[:3]):
-                        text = p.get_text(strip=True)
-                        if text and len(text) > 50:
-                            key_points.append(text[:200] + "..." if len(text) > 200 else text)
-                
-                entities = extract_entities(main_content)
-                
-                keywords = []
-                title_elem = soup.find('title')
-                if title_elem:
-                    title_words = title_elem.get_text().split()
-                    keywords.extend([w for w in title_words if len(w) > 3 and not w.lower() in ['the', 'and', 'for', 'are', 'but', 'not']])
-                
-                meta_keywords = soup.find('meta', attrs={'name': 'keywords'})
-                if meta_keywords:
-                    meta_words = meta_keywords.get('content', '').split(',')
-                    keywords.extend([w.strip() for w in meta_words if len(w.strip()) > 3])
-                
-                keywords = list(dict.fromkeys(keywords))[:20]
-                
-                return {
-                    "summary": fallback_content[:300] + "..." if len(fallback_content) > 300 else fallback_content,
-                    "key_points": key_points,
-                    "main_content": main_content[:1000] + "..." if len(main_content) > 1000 else main_content,
-                    "entities": entities[:10],
-                    "keywords": keywords
-                }
-                
-    except Exception as e:
-        logger.warning(f"Failed to extract enhanced content from {url}: {e}")
-        return {
-            "summary": fallback_content,
-            "key_points": [],
-            "main_content": "",
-            "entities": [],
-            "keywords": []
-        }
-
-def extract_entities(text: str) -> list:
-    import re
-    
-    entities = []
-    
-    names = re.findall(r'\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*\b', text)
-    entities.extend(names)
-    
-    orgs = re.findall(r'\b[A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z]{2,})*\s+(?:Inc|Corp|LLC|Ltd|Co)\b', text)
-    entities.extend(orgs)
-    
-    dates = re.findall(r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b', text)
-    entities.extend(dates)
-    
-    urls = re.findall(r'https?://[^\s]+', text)
-    entities.extend(urls)
-    
-    return list(dict.fromkeys(entities))
-
-async def extract_images_from_result(url: str, max_images: int = 2) -> list:
-    if not url:
-        return []
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            })
-            
-            if response.status_code == 200:
-                from bs4 import BeautifulSoup
-                
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                for script in soup(["script", "style"]):
-                    script.decompose()
-                
-                images = []
-                img_selectors = [
-                    'img[src*=".jpg"], img[src*=".jpeg"], img[src*=".png"], img[src*=".gif"]',
-                    'img',
-                    '.image img',
-                    '.gallery img',
-                    '.photo img',
-                    '.thumbnail img'
-                ]
-                
-                for selector in img_selectors:
-                    img_elements = soup.select(selector)
-                    if img_elements:
-                        break
-                
-                if not img_elements:
-                    img_elements = soup.find_all('img')
-                
-                for img in img_elements[:max_images]:
-                    img_url = img.get('src', '')
-                    alt_text = img.get('alt', '')
-                    
-                    if img_url and not img_url.startswith(('http://', 'https://')):
-                        try:
-                            parsed_url = urllib.parse.urlparse(url)
-                            base = f"{parsed_url.scheme}://{parsed_url.netloc}"
-                            if img_url.startswith('/'):
-                                img_url = f"{base}{img_url}"
-                            else:
-                                base_path = '/'.join(parsed_url.path.split('/')[:-1])
-                                img_url = f"{base}{base_path}/{img_url}" if base_path else f"{base}/{img_url}"
-                        except:
-                            pass
-                    
-                    if img_url and img_url.startswith(('http://', 'https://')):
-                        images.append({
-                            "url": img_url,
-                            "alt": alt_text[:100] if alt_text else "No description"
-                        })
-                
-                return images[:max_images]
-                
-    except Exception as e:
-        logger.warning(f"Failed to extract images from {url}: {e}")
-        return []
-
-def format_search_results(search_data: dict) -> str:
-    if not search_data.get("success"):
-        return f"Search failed: {search_data.get('error', 'Unknown error')}"
-    
-    results = search_data.get("results", [])
-    if not results:
-        return "No search results found."
-    
-    formatted = []
-    for i, res in enumerate(results, 1):
-        title = res.get("title", "Untitled")
-        url = res.get("url", "")
-        content = res.get("content", "No content available.")
-        enhanced_content = res.get("enhanced_content", {}) or {}
-        
-        if not isinstance(enhanced_content, dict):
-            enhanced_content = {}
-        
-        key_points = enhanced_content.get("key_points", [])
-        entities = enhanced_content.get("entities", [])
-        keywords = enhanced_content.get("keywords", [])
-        
-        if len(content) > 200:
-            content = content[:200] + "..."
-        
-        result_text = f"{i}. [{title}]({url})\n"
-        result_text += f"   {content}\n"
-        
-        if enhanced_content.get("main_content"):
-            main_content_preview = enhanced_content["main_content"][:300] + "..." if len(enhanced_content["main_content"]) > 300 else enhanced_content["main_content"]
-            result_text += f"   Main content preview: {main_content_preview}\n"
-        
-        if key_points:
-            result_text += "   Key points:\n"
-            for point in key_points[:2]:
-                result_text += f"     • {point}\n"
-        
-        if entities:
-            entities_preview = ", ".join(entities[:3])
-            result_text += f"   Entities: {entities_preview}\n"
-        
-        if keywords:
-            keywords_preview = ", ".join(keywords[:5])
-            result_text += f"   Keywords: {keywords_preview}\n"
-        
-        images = res.get("images", [])
-        if images:
-            image_urls = [f"[Image {j+1}]({img['url']})" for j, img in enumerate(images)]
-            result_text += f"   🖼️ Images: {', '.join(image_urls)}\n"
-        
-        formatted.append(result_text)
-    
-    full_text = "Here are some enhanced search results:\n\n" + "\n\n".join(formatted)
-    
-    max_length = 2000
-    if len(full_text) > max_length:
-        full_text = full_text[:max_length-3] + "..."
-    
-    return full_text
 
 @dataclass
 class MsgNode:
+    role: Literal["user", "assistant"] = "assistant"
     text: Optional[str] = None
     images: list[dict[str, Any]] = field(default_factory=list)
-    role: Literal["user", "assistant"] = "assistant"
-    user_id: Optional[int] = None
     has_bad_attachments: bool = False
     fetch_parent_failed: bool = False
     parent_msg: Optional[discord.Message] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-# Image generation functions
+
 async def image_generation_worker():
     while True:
         try:
@@ -712,7 +115,6 @@ async def image_generation_worker():
             
             async with queue_lock:
                 queue_position = image_queue.qsize() + 1
-                image_queue_positions[request_id] = queue_position
             
             try:
                 image_data = await generate_image(prompt, negative_prompt, provider_config, parameters)
@@ -725,42 +127,44 @@ async def image_generation_worker():
                         if "," in image_data:
                             _, image_data = image_data.split(",", 1)
                         
-                        image_bytes = b64decode(image_data)
+                        import base64
+                        image_bytes = base64.b64decode(image_data)
                         
                         with open(filepath, "wb") as f:
                             f.write(image_bytes)
                         
                         image_results[request_id] = {"status": "success", "filepath": filepath}
-                        logger.info(f"Image saved successfully: {filepath}")
+                        logging.info(f"Image saved successfully: {filepath}")
                     except Exception as e:
-                        logger.exception(f"Error saving generated image: {e}")
+                        logging.exception(f"Error saving generated image: {e}")
                         image_results[request_id] = {"status": "error", "error": str(e)}
                 else:
                     image_results[request_id] = {"status": "error", "error": "Failed to generate image"}
                     
             except Exception as e:
-                logger.exception(f"Error processing image generation: {e}")
+                logging.exception(f"Error processing image generation: {e}")
                 image_results[request_id] = {"status": "error", "error": str(e)}
             
             finally:
                 async with queue_lock:
-                    image_queue_positions.pop(request_id, None)
+                    pass
                 image_queue.task_done()
                 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.exception(f"Unexpected error in image worker: {e}")
+            logging.exception(f"Unexpected error in image worker: {e}")
+
 
 async def generate_image(prompt: str, negative_prompt: str, provider_config: dict, parameters: dict = None) -> Optional[str]:
     try:
         forge_url = provider_config.get("forge_url")
         if not forge_url:
-            logger.error("Forge URL not configured for image generation")
+            logging.error("Forge URL not configured for image generation")
             return None
             
         default_params = provider_config.get("default_params", {})
-        default_model = provider_config.get("default_model", "novaMatureXL_v35")
+        default_model = provider_config.get("default_model", "default")
         default_size = provider_config.get("default_size", "768x768")
         
         width, height = map(int, default_size.split('x'))
@@ -797,8 +201,7 @@ async def generate_image(prompt: str, negative_prompt: str, provider_config: dic
         
         headers = {"Content-Type": "application/json"}
         
-        logger.info(f"Sending image generation request to {forge_url}")
-        logger.info(f"Payload: {payload}")
+        logging.info(f"Sending image generation request to {forge_url}")
         
         async with httpx.AsyncClient(timeout=provider_config.get("timeout", 720.0)) as client:
             response = await client.post(
@@ -807,108 +210,25 @@ async def generate_image(prompt: str, negative_prompt: str, provider_config: dic
                 headers=headers
             )
             
-            logger.info(f"Response status: {response.status_code}")
-            logger.info(f"Response text (first 200 chars): {response.text[:200]}...")
-            
             if response.status_code == 200:
                 try:
                     data = response.json()
-                    logger.info(f"Response data keys: {list(data.keys())}")
                     if "images" in data and len(data["images"]) > 0:
                         return data["images"][0]
                     else:
-                        logger.error("No images returned from image generation")
-                        logger.error(f"Full response: {data}")
+                        logging.error("No images returned from image generation")
                         return None
                 except Exception as e:
-                    logger.exception(f"Error parsing JSON response: {e}")
-                    logger.error(f"Raw response: {response.text}")
+                    logging.exception(f"Error parsing JSON response: {e}")
                     return None
             else:
-                logger.error(f"Image generation failed: {response.status_code} - {response.text}")
+                logging.error(f"Image generation failed: {response.status_code} - {response.text}")
                 return None
                 
     except Exception as e:
-        logger.exception(f"Error generating image: {e}")
+        logging.exception(f"Error generating image: {e}")
         return None
 
-# Commands (without /tools)
-@discord_bot.tree.command(name="diagnose_websearch", description="Diagnose web search configuration (Admin only)")
-async def diagnose_websearch_command(interaction: discord.Interaction):
-    config = await asyncio.to_thread(get_config)
-    permissions = config.get("permissions", {
-        "users": {
-            "admin_ids": config.get("admin_user_ids", []),
-            "allowed_ids": [],
-            "blocked_ids": []
-        }
-    })
-    
-    user_is_admin = interaction.user.id in permissions["users"]["admin_ids"]
-    
-    if not user_is_admin:
-        await interaction.response.send_message("Only administrators can use this command.", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    result = await web_search("test query")
-    
-    embed = discord.Embed(
-        title="Web Search Diagnosis",
-        color=EMBED_COLOR_ERROR if not result["success"] else EMBED_COLOR_COMPLETE
-    )
-    
-    if result["success"]:
-        embed.description = f"✅ Web search is working!\nFound {len(result['results'])} results."
-        if result['results']:
-            embed.add_field(name="Sample Result", value=result['results'][0]['title'][:100] + "..." if result['results'] else "No results", inline=False)
-    else:
-        embed.description = f"❌ Web search failed: {result['error']}"
-        embed.add_field(
-            name="Troubleshooting Tips",
-            value=(
-                "1. Verify the endpoint URL points to an API, not a web interface\n"
-                "2. Try adding '/api' or '/search' to the base URL\n"
-                "3. Ensure the server has API enabled\n"
-                "4. Check if authentication is required"
-            ),
-            inline=False
-        )
-    
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-@discord_bot.tree.command(name="test_websearch", description="Test the web search functionality (Admin only)")
-async def test_websearch_command(interaction: discord.Interaction):
-    config = await asyncio.to_thread(get_config)
-    permissions = config.get("permissions", {
-        "users": {
-            "admin_ids": config.get("admin_user_ids", []),
-            "allowed_ids": [],
-            "blocked_ids": []
-        }
-    })
-    
-    user_is_admin = interaction.user.id in permissions["users"]["admin_ids"]
-    
-    if not user_is_admin:
-        await interaction.response.send_message("Only administrators can use this command.", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    result = await web_search("test query")
-    
-    if result["success"]:
-        await interaction.followup.send(
-            f"Web search test successful! Found {len(result['results'])} results.",
-            ephemeral=True
-        )
-    else:
-        await interaction.followup.send(
-            f"Web search test failed: {result['error']}",
-            ephemeral=True
-        )
 
 @discord_bot.tree.command(name="image", description="Generate an image from a prompt")
 async def image_command(interaction: discord.Interaction, 
@@ -916,23 +236,29 @@ async def image_command(interaction: discord.Interaction,
                        negative_prompt: Optional[str] = None) -> None:
     await interaction.response.defer(ephemeral=False)
     
-    llm_config = config.get("llm", {})
     image_providers = llm_config.get("image_generator", {})
     
     if not image_providers:
         await interaction.followup.send("Image generation is not configured.", ephemeral=True)
         return
     
-    provider_config = image_providers.get(current_image_provider, {})
+    actual_providers = {k: v for k, v in image_providers.items() if isinstance(v, dict) and 'forge_url' in v}
+    
+    if not actual_providers:
+        await interaction.followup.send("No valid image providers configured.", ephemeral=True)
+        return
+    
+    provider_config = actual_providers.get(current_image_provider or list(actual_providers.keys())[0], {})
     if not provider_config:
-        await interaction.followup.send(f"Image provider '{current_image_provider}' not found.", ephemeral=True)
+        await interaction.followup.send(f"Image provider not found.", ephemeral=True)
         return
     
     request_id = str(uuid.uuid4())
-    await image_queue.put((request_id, prompt, negative_prompt or "", provider_config, {}, interaction.user.id))
     
     async with queue_lock:
         queue_position = image_queue.qsize() + 1
+    
+    await image_queue.put((request_id, prompt, negative_prompt or "", provider_config, {}, interaction.user.id))
     
     queue_msg = f"Your image generation request has been added to the queue. You are at position **#{queue_position}**."
     await interaction.followup.send(queue_msg, ephemeral=True)
@@ -958,10 +284,10 @@ async def image_command(interaction: discord.Interaction,
                     try:
                         os.remove(filepath)
                     except Exception as e:
-                        logger.warning(f"Could not delete temporary image file {filepath}: {e}")
+                        logging.warning(f"Could not delete temporary image file {filepath}: {e}")
                         
                 except Exception as e:
-                    logger.exception(f"Error sending generated image: {e}")
+                    logging.exception(f"Error sending generated image: {e}")
                     await interaction.followup.send("Failed to send generated image.", ephemeral=True)
             else:
                 error_msg = result.get("error", "Unknown error")
@@ -973,6 +299,7 @@ async def image_command(interaction: discord.Interaction,
     
     await interaction.followup.send("Image generation timed out after 20 minutes.", ephemeral=True)
 
+
 @discord_bot.tree.command(name="image_advanced", description="Generate an image with advanced parameters")
 async def image_advanced_command(interaction: discord.Interaction, 
                                 prompt: str,
@@ -983,16 +310,21 @@ async def image_advanced_command(interaction: discord.Interaction,
                                 height: Optional[int] = None) -> None:
     await interaction.response.defer(ephemeral=False)
     
-    llm_config = config.get("llm", {})
     image_providers = llm_config.get("image_generator", {})
     
     if not image_providers:
         await interaction.followup.send("Image generation is not configured.", ephemeral=True)
         return
     
-    provider_config = image_providers.get(current_image_provider, {})
+    actual_providers = {k: v for k, v in image_providers.items() if isinstance(v, dict) and 'forge_url' in v}
+    
+    if not actual_providers:
+        await interaction.followup.send("No valid image providers configured.", ephemeral=True)
+        return
+    
+    provider_config = actual_providers.get(current_image_provider or list(actual_providers.keys())[0], {})
     if not provider_config:
-        await interaction.followup.send(f"Image provider '{current_image_provider}' not found.", ephemeral=True)
+        await interaction.followup.send(f"Image provider not found.", ephemeral=True)
         return
     
     parameters = {}
@@ -1006,10 +338,11 @@ async def image_advanced_command(interaction: discord.Interaction,
         parameters["height"] = height
     
     request_id = str(uuid.uuid4())
-    await image_queue.put((request_id, prompt, negative_prompt or "", provider_config, parameters, interaction.user.id))
     
     async with queue_lock:
         queue_position = image_queue.qsize() + 1
+    
+    await image_queue.put((request_id, prompt, negative_prompt or "", provider_config, parameters, interaction.user.id))
     
     queue_msg = f"Your image generation request has been added to the queue. You are at position **#{queue_position}**."
     await interaction.followup.send(queue_msg, ephemeral=True)
@@ -1035,10 +368,10 @@ async def image_advanced_command(interaction: discord.Interaction,
                     try:
                         os.remove(filepath)
                     except Exception as e:
-                        logger.warning(f"Could not delete temporary image file {filepath}: {e}")
+                        logging.warning(f"Could not delete temporary image file {filepath}: {e}")
                         
                 except Exception as e:
-                    logger.exception(f"Error sending generated image: {e}")
+                    logging.exception(f"Error sending generated image: {e}")
                     await interaction.followup.send("Failed to send generated image.", ephemeral=True)
             else:
                 error_msg = result.get("error", "Unknown error")
@@ -1050,11 +383,11 @@ async def image_advanced_command(interaction: discord.Interaction,
     
     await interaction.followup.send("Image generation timed out after 20 minutes.", ephemeral=True)
 
+
 @discord_bot.tree.command(name="providers", description="Switch between different providers/endpoints")
 async def providers_command(interaction: discord.Interaction, provider: str) -> None:
     global current_provider, current_model
     
-    llm_config = config.get("llm", {})
     providers = llm_config.get("providers", {})
     
     if not providers:
@@ -1083,14 +416,14 @@ async def providers_command(interaction: discord.Interaction, provider: str) -> 
     current_model = default_model
     output = f"Switched to provider: `{provider}` with model: `{default_model}`"
         
-    logger.info(output)
+    logging.info(output)
     await interaction.response.send_message(output, ephemeral=True)
+
 
 @discord_bot.tree.command(name="image_providers", description="Switch between different image generation providers")
 async def image_providers_command(interaction: discord.Interaction, provider: str) -> None:
     global current_image_provider
     
-    llm_config = config.get("llm", {})
     image_providers = llm_config.get("image_generator", {})
     
     if not image_providers:
@@ -1114,24 +447,16 @@ async def image_providers_command(interaction: discord.Interaction, provider: st
     current_image_provider = provider
     output = f"Switched to image provider: `{provider}`"
         
-    logger.info(output)
+    logging.info(output)
     await interaction.response.send_message(output, ephemeral=True)
+
 
 @discord_bot.tree.command(name="allow_dm", description="Toggle Direct Message functionality (Admin only)")
 async def allow_dm_command(interaction: discord.Interaction, enabled: bool) -> None:
-    config = await asyncio.to_thread(get_config)
     permissions = config.get("permissions", {
         "users": {
             "admin_ids": config.get("admin_user_ids", []),
             "allowed_ids": [],
-            "blocked_ids": []
-        },
-        "roles": {
-            "allowed_ids": [],
-            "blocked_ids": []
-        },
-        "channels": {
-            "allowed_ids": config.get("allowed_channel_ids", []),
             "blocked_ids": []
         }
     })
@@ -1147,89 +472,76 @@ async def allow_dm_command(interaction: discord.Interaction, enabled: bool) -> N
             current_config = yaml.safe_load(f) or {}
         
         current_config["allow_dms"] = enabled
+        if "llm" not in current_config:
+            current_config["llm"] = {}
+        current_config["llm"]["allow_dms"] = enabled
         
         with open("config.yaml", "w", encoding="utf-8") as f:
             yaml.dump(current_config, f, default_flow_style=False, allow_unicode=True)
         
         status = "enabled" if enabled else "disabled"
         message = f"Direct Messages have been {status}."
-        logger.info(message)
+        logging.info(message)
         await interaction.response.send_message(message, ephemeral=True)
         
     except Exception as e:
         error_msg = f"Failed to update DM settings: {e}"
-        logger.error(error_msg)
+        logging.error(error_msg)
         await interaction.response.send_message(error_msg, ephemeral=True)
 
-@discord_bot.tree.command(name="image_triggers", description="Show configured image triggers")
-async def image_triggers_command(interaction: discord.Interaction):
-    try:
-        config = await asyncio.to_thread(get_config)
-        image_config = config.get("llm", {}).get("image_generator", {})
-        image_triggers = image_config.get("image_triggers", [
-            "make me an image",
-            "generate image",
-            "create an image",
-            "draw this",
-            "show me a picture of",
-            "image of",
-            "picture of"
-        ])
-        
-        triggers_list = "\n".join([f"• {trigger}" for trigger in image_triggers])
-        
-        embed = discord.Embed(
-            title="Image Generation Triggers",
-            description=f"**Current image triggers:**\n{triggers_list}",
-            color=discord.Color.blue()
-        )
-        embed.set_footer(text="These triggers will activate image generation")
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        
-    except Exception as e:
-        logger.exception(f"Error showing image triggers: {e}")
-        await interaction.response.send_message("Failed to retrieve image triggers.", ephemeral=True)
 
-@discord_bot.tree.command(name="web_search_triggers", description="Show configured web search triggers")
-async def web_search_triggers_command(interaction: discord.Interaction):
+@discord_bot.tree.command(name="toggle_jinja", description="Toggle Jinja template support for LLM models (Admin only)")
+async def toggle_jinja_command(interaction: discord.Interaction, enabled: bool) -> None:
+    permissions = config.get("permissions", {
+        "users": {
+            "admin_ids": config.get("admin_user_ids", []),
+            "allowed_ids": [],
+            "blocked_ids": []
+        }
+    })
+    
+    user_is_admin = interaction.user.id in permissions["users"]["admin_ids"]
+    
+    if not user_is_admin:
+        await interaction.response.send_message("Only administrators can use this command.", ephemeral=True)
+        return
+    
     try:
-        config = await asyncio.to_thread(get_config)
-        web_search_config = config.get("llm", {}).get("web_search", {})
-        trigger_words = web_search_config.get("trigger_words", [
-            "search", "find", "google", "look up", "who is", 
-            "find me", "double check", "check again", "what is", "doublecheck"
-        ])
+        with open("config.yaml", "r", encoding="utf-8") as f:
+            current_config = yaml.safe_load(f) or {}
         
-        triggers_list = "\n".join([f"• {trigger}" for trigger in trigger_words])
+        if "llm" not in current_config:
+            current_config["llm"] = {}
         
-        embed = discord.Embed(
-            title="Web Search Triggers",
-            description=f"**Current web search triggers:**\n{triggers_list}",
-            color=discord.Color.green()
-        )
-        embed.set_footer(text="These triggers will activate web search")
+        current_config["llm"]["enable_jinja"] = enabled
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        with open("config.yaml", "w", encoding="utf-8") as f:
+            yaml.dump(current_config, f, default_flow_style=False, allow_unicode=True)
+        
+        status = "enabled" if enabled else "disabled"
+        message = f"Jinja template support has been {status}."
+        logging.info(message)
+        await interaction.response.send_message(message, ephemeral=True)
         
     except Exception as e:
-        logger.exception(f"Error showing web search triggers: {e}")
-        await interaction.response.send_message("Failed to retrieve web search triggers.", ephemeral=True)
+        error_msg = f"Failed to update Jinja settings: {e}"
+        logging.error(error_msg)
+        await interaction.response.send_message(error_msg, ephemeral=True)
+
 
 @providers_command.autocomplete("provider")
-async def provider_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[AppChoice[str]]:
-    llm_config = config.get("llm", {})
+async def provider_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
     providers = llm_config.get("providers", {})
     
     if not providers:
         return []
         
     filtered_providers = [p for p in providers.keys() if curr_str.lower() in p.lower()]
-    return [AppChoice(name=p, value=p) for p in filtered_providers[:25]]
+    return [Choice(name=p, value=p) for p in filtered_providers[:25]]
+
 
 @image_providers_command.autocomplete("provider")
-async def image_provider_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[AppChoice[str]]:
-    llm_config = config.get("llm", {})
+async def image_provider_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
     image_providers = llm_config.get("image_generator", {})
     
     if not image_providers:
@@ -1241,42 +553,55 @@ async def image_provider_autocomplete(interaction: discord.Interaction, curr_str
         return []
         
     filtered_providers = [p for p in actual_providers if curr_str.lower() in p.lower()]
-    return [AppChoice(name=p, value=p) for p in filtered_providers[:25]]
+    return [Choice(name=p, value=p) for p in filtered_providers[:25]]
+
 
 @discord_bot.event
 async def on_ready() -> None:
     if client_id := config.get("client_id"):
-        logger.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot\n")
+        logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot\n")
 
-    try:
-        synced = await discord_bot.tree.sync()
-        logger.info(f"Synced {len(synced)} command(s)")
-        for cmd in synced:
-            logger.info(f"  - {cmd.name}")
-    except Exception as e:
-        logger.error(f"Failed to sync commands: {e}")
+    await discord_bot.tree.sync()
     
     discord_bot.loop.create_task(image_generation_worker())
 
+
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
-    global last_task_time, current_provider, current_model
+    global last_task_time, current_provider, current_model, current_image_provider
 
     is_dm = new_msg.channel.type == discord.ChannelType.private
 
     if new_msg.author.bot:
         return
 
+    config = await asyncio.to_thread(get_config)
+    llm_config = config.get("llm", {})
+
     should_process = False
-    should_process = is_dm or discord_bot.user.mention in new_msg.content
+    
+    has_mention = discord_bot.user.mention in new_msg.content
+    
+    triggerword_enabled = llm_config.get("enable_triggerword", False)
+    triggerword = llm_config.get("triggerword", "").lower().strip()
+    has_triggerword = False
+    
+    if triggerword_enabled and triggerword:
+        content_lower = new_msg.content.lower()
+        if content_lower.startswith(triggerword) or content_lower.startswith(f"{triggerword} "):
+            has_triggerword = True
+        elif f" {triggerword} " in content_lower:
+            has_triggerword = True
+        elif f" {triggerword}" in content_lower and content_lower.endswith(triggerword):
+            has_triggerword = True
+    
+    should_process = is_dm or has_mention or has_triggerword
 
     if not should_process:
         return
 
     role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
     channel_ids = set(filter(None, (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None))))
-
-    config = await asyncio.to_thread(get_config)
 
     allow_dms = config.get("allow_dms", True)
 
@@ -1316,8 +641,6 @@ async def on_message(new_msg: discord.Message) -> None:
     if is_bad_user or is_bad_channel:
         return
 
-    llm_config = config.get("llm", {})
-    
     if current_provider is None:
         providers = llm_config.get("providers", {})
         if providers:
@@ -1332,14 +655,18 @@ async def on_message(new_msg: discord.Message) -> None:
                     current_model = default_model
             else:
                 current_model = "qwen3"
-        else:
-            logger.error("No providers configured!")
-            return
     
+    if current_image_provider is None:
+        image_providers = llm_config.get("image_generator", {})
+        if image_providers:
+            actual_providers = {k: v for k, v in image_providers.items() if isinstance(v, dict) and 'forge_url' in v}
+            if actual_providers:
+                current_image_provider = list(actual_providers.keys())[0]
+
     provider_config = llm_config.get("providers", {}).get(current_provider, {})
     
     if not provider_config:
-        logger.error(f"Provider configuration not found for: {current_provider}")
+        logging.error(f"Provider configuration not found for: {current_provider}")
         return
 
     base_url = provider_config["base_url"]
@@ -1354,24 +681,32 @@ async def on_message(new_msg: discord.Message) -> None:
     extra_headers = provider_config.get("extra_headers")
     extra_query = provider_config.get("extra_query")
     
-    # Check if we should disable thinking for Qwen3.5 models
     reasoning_config = llm_config.get("reasoning") or {}
     completely_disable_reasoning = reasoning_config.get("completely_disable_reasoning", False)
+    reasoning_effort = reasoning_config.get("reasoning_effort", "")
     
-    # Build extra_body with thinking disabled if configured
     base_extra_body = provider_config.get("extra_body") or {}
     if model_parameters:
         base_extra_body = base_extra_body | model_parameters
     
-    # Add Qwen3.5 thinking disable parameter if completely_disable_reasoning is true
     if completely_disable_reasoning:
-        # Qwen3.5 API parameter to disable thinking
         base_extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        base_extra_body["enable_thinking"] = False
+        base_extra_body["no_thinking"] = True
+        base_extra_body["disable_thinking"] = True
+        base_extra_body["thinking"] = False
+    
+    if reasoning_effort:
+        max_tokens = config.get("llm", {}).get("extra_api_parameters", {}).get("max_tokens", 4096)
+        reasoning_budget = parse_reasoning_effort(reasoning_effort, max_tokens)
+        if reasoning_budget >= 0:
+            base_extra_body["reasoning_effort"] = reasoning_effort
+            base_extra_body["reasoning_budget"] = reasoning_budget
+            logging.info(f"Reasoning effort set to '{reasoning_effort}' with budget of {reasoning_budget} tokens")
     
     extra_body = base_extra_body if base_extra_body else None
 
     accept_images = any(x in current_model.lower() for x in VISION_MODEL_TAGS) if current_model else False
-    accept_usernames = any(current_provider.lower().startswith(x) for x in PROVIDERS_SUPPORTING_USERNAMES)
 
     max_text = config.get("max_text", 100000)
     max_images = config.get("max_images", 5) if accept_images else 0
@@ -1381,21 +716,39 @@ async def on_message(new_msg: discord.Message) -> None:
     user_warnings = set()
     curr_msg = new_msg
 
-    while curr_msg != None and len(messages) < max_messages:
+    while curr_msg is not None and len(messages) < max_messages:
         curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
 
         async with curr_node.lock:
-            if curr_node.text == None:
-                cleaned_content = new_msg.content.removeprefix(discord_bot.user.mention).lstrip()
+            if curr_node.text is None:
+                cleaned_content = curr_msg.content
+                
+                if discord_bot.user.mention in cleaned_content:
+                    cleaned_content = cleaned_content.removeprefix(discord_bot.user.mention).lstrip()
+                
+                triggerword_enabled = llm_config.get("enable_triggerword", False)
+                triggerword = llm_config.get("triggerword", "").strip()
+                if triggerword_enabled and triggerword:
+                    content_lower = cleaned_content.lower()
+                    if content_lower.startswith(triggerword):
+                        cleaned_content = cleaned_content[len(triggerword):].lstrip()
+                    elif content_lower.startswith(f"{triggerword} "):
+                        cleaned_content = cleaned_content[len(triggerword) + 1:].lstrip()
+                    elif f" {triggerword} " in content_lower:
+                        cleaned_content = cleaned_content.replace(f" {triggerword} ", " ", 1).strip()
+                    elif f" {triggerword}" in content_lower and content_lower.endswith(triggerword):
+                        cleaned_content = cleaned_content[:content_lower.rfind(f" {triggerword}")].strip()
+                
+                cleaned_content = cleaned_content.lstrip()
 
-                good_attachments = [att for att in new_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
+                good_attachments = [att for att in curr_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
 
                 attachment_responses = await asyncio.gather(*[httpx_client.get(att.url) for att in good_attachments])
 
                 curr_node.text = "\n".join(
                     ([cleaned_content] if cleaned_content else [])
-                    + ["\n".join(filter(None, (embed.title, embed.description, embed.footer.text))) for embed in new_msg.embeds]
-                    + [component.content for component in new_msg.components if component.type == discord.ComponentType.text_display]
+                    + ["\n".join(filter(None, (embed.title, embed.description, embed.footer.text))) for embed in curr_msg.embeds]
+                    + [component.content for component in curr_msg.components if component.type == discord.ComponentType.text_display]
                     + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
                 )
 
@@ -1404,67 +757,55 @@ async def on_message(new_msg: discord.Message) -> None:
                     for att, resp in zip(good_attachments, attachment_responses)
                     if att.content_type.startswith("image")
                 ]
-                
-                curr_node.role = "assistant" if new_msg.author == discord_bot.user else "user"
 
-                curr_node.user_id = new_msg.author.id if curr_node.role == "user" else None
+                curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
 
-                curr_node.has_bad_attachments = len(new_msg.attachments) > len(good_attachments)
+                curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
 
                 try:
                     if (
-                        new_msg.reference == None
-                        and discord_bot.user.mention not in new_msg.content
-                        and (prev_msg_in_channel := ([m async for m in new_msg.channel.history(before=new_msg, limit=1)] or [None])[0])
+                        curr_msg.reference is None
+                        and discord_bot.user.mention not in curr_msg.content
+                        and (prev_msg_in_channel := ([m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None])[0])
                         and prev_msg_in_channel.type in (discord.MessageType.default, discord.MessageType.reply)
-                        and prev_msg_in_channel.author == (discord_bot.user if new_msg.channel.type == discord.ChannelType.private else new_msg.author)
+                        and prev_msg_in_channel.author == (discord_bot.user if curr_msg.channel.type == discord.ChannelType.private else curr_msg.author)
                     ):
                         curr_node.parent_msg = prev_msg_in_channel
                     else:
-                        is_public_thread = new_msg.channel.type == discord.ChannelType.public_thread
-                        parent_is_thread_start = is_public_thread and new_msg.reference == None and new_msg.channel.parent.type == discord.ChannelType.text
+                        is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
+                        parent_is_thread_start = is_public_thread and curr_msg.reference is None and curr_msg.channel.parent.type == discord.ChannelType.text
 
-                        if parent_msg_id := new_msg.channel.id if parent_is_thread_start else getattr(new_msg.reference, "message_id", None):
+                        if parent_msg_id := curr_msg.channel.id if parent_is_thread_start else getattr(curr_msg.reference, "message_id", None):
                             if parent_is_thread_start:
-                                curr_node.parent_msg = new_msg.channel.starter_message or await new_msg.channel.parent.fetch_message(parent_msg_id)
+                                curr_node.parent_msg = curr_msg.channel.starter_message or await curr_msg.channel.parent.fetch_message(parent_msg_id)
                             else:
-                                curr_node.parent_msg = new_msg.reference.cached_message or await new_msg.channel.fetch_message(parent_msg_id)
+                                curr_node.parent_msg = curr_msg.reference.cached_message or await curr_msg.channel.fetch_message(parent_msg_id)
 
                 except (discord.NotFound, discord.HTTPException):
-                    logger.exception("Error fetching next message in the chain")
+                    logging.exception("Error fetching next message in the chain")
                     curr_node.fetch_parent_failed = True
 
             if curr_node.images[:max_images]:
-                content = ([dict(type="text", text=curr_node.text[:max_text])] if curr_node.text[:max_text] else []) + curr_node.images[:max_images]
+                content = [dict(type="text", text=curr_node.text[:max_text])] + curr_node.images[:max_images] if curr_node.text and curr_node.text[:max_text] else curr_node.images[:max_images]
             else:
-                content = curr_node.text[:max_text]
+                content = curr_node.text[:max_text] if curr_node.text else ""
 
             if content != "":
-                message = dict(content=content, role=curr_node.role)
-                if accept_usernames and curr_node.user_id != None:
-                    try:
-                        user = await discord_bot.fetch_user(curr_node.user_id)
-                        display_name = user.display_name
-                        message["name"] = display_name
-                    except:
-                        message["name"] = str(curr_node.user_id)
+                messages.append(dict(content=content, role=curr_node.role))
 
-                messages.append(message)
-
-            if len(curr_node.text) > max_text:
+            if curr_node.text and len(curr_node.text) > max_text:
                 user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
-            if len(curr_node.images) > max_images:
+            if curr_node.images and len(curr_node.images) > max_images:
                 user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
             if curr_node.has_bad_attachments:
                 user_warnings.add("⚠️ Unsupported attachments")
-            if curr_node.fetch_parent_failed or (curr_node.parent_msg != None and len(messages) == max_messages):
+            if curr_node.fetch_parent_failed or (curr_node.parent_msg is not None and len(messages) == max_messages):
                 user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
 
             curr_msg = curr_node.parent_msg
 
-    logger.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
+    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
-    # Image trigger detection
     image_generator_enabled = "image_generator" in llm_config.get("active_tools", [])
     image_providers = llm_config.get("image_generator", {})
     
@@ -1496,25 +837,26 @@ async def on_message(new_msg: discord.Message) -> None:
                 break
         
         if trigger_found and prompt_text:
-            logger.info(f"Image trigger detected: {new_msg.content}")
+            logging.info(f"Image trigger detected: {new_msg.content}")
             
             try:
                 await new_msg.channel.trigger_typing()
             except:
                 pass
             
-            provider_config = image_providers.get(current_image_provider, {})
+            actual_providers = {k: v for k, v in image_providers.items() if isinstance(v, dict) and 'forge_url' in v}
+            provider_config = actual_providers.get(current_image_provider or list(actual_providers.keys())[0], {})
             if not provider_config:
-                logger.error(f"Image provider '{current_image_provider}' not found for trigger")
+                logging.error(f"Image provider not found for trigger")
                 return
             
             request_id = str(uuid.uuid4())
-            await image_queue.put((request_id, prompt_text, "", provider_config, {}, new_msg.author.id))
             
             async with queue_lock:
                 queue_position = image_queue.qsize() + 1
             
-            # Send a simple queue position message without the "Your image generation request has been added to the queue" text
+            await image_queue.put((request_id, prompt_text, "", provider_config, {}, new_msg.author.id))
+            
             queue_msg = f"You are at position **#{queue_position}** in the image generation queue."
             await new_msg.reply(queue_msg, mention_author=False)
             
@@ -1537,10 +879,10 @@ async def on_message(new_msg: discord.Message) -> None:
                             try:
                                 os.remove(filepath)
                             except Exception as e:
-                                logger.warning(f"Could not delete temporary image file {filepath}: {e}")
+                                logging.warning(f"Could not delete temporary image file {filepath}: {e}")
                                 
                         except Exception as e:
-                            logger.exception(f"Error sending generated image: {e}")
+                            logging.exception(f"Error sending generated image: {e}")
                             await new_msg.reply("Failed to send generated image.", mention_author=False)
                     else:
                         error_msg = result.get("error", "Unknown error")
@@ -1553,57 +895,67 @@ async def on_message(new_msg: discord.Message) -> None:
             await new_msg.reply("Image generation timed out after 20 minutes.", mention_author=False)
             return
 
-    # Web search integration
     if "web_search" in llm_config.get("active_tools", []):
         web_search_config = llm_config.get("web_search", {})
         trigger_words = web_search_config.get("trigger_words", [
             "search", "find", "google", "look up", "who is", 
-            "find me", "double check", "check again", "what is", "doublecheck"
+            "double check", "check again", "what is", "doublecheck"
         ])
         
         if any(word in new_msg.content.lower() for word in trigger_words):
-            logger.info(f"Trigger word found in message: {new_msg.content}")
+            logging.info(f"Trigger word found in message: {new_msg.content}")
             
-            search_data = await web_search(new_msg.content)
+            base_url = web_search_config.get("search_url")
+            max_results = web_search_config.get("max_results", 5)
+            timeout = web_search_config.get("timeout", 30)
             
-            if search_data["success"] and search_data["results"]:
-                formatted_search = format_search_results(search_data)
+            try:
+                params = {"q": new_msg.content, "format": "json"}
+                response = await httpx_client.get(base_url, params=params, timeout=timeout)
+                content_type = response.headers.get('content-type', '')
                 
-                search_message = {
-                    "role": "user",
-                    "content": formatted_search
-                }
-                messages.insert(1, search_message)
-                
-                logger.info("Search results formatted and added to conversation for LLM processing")
-            else:
-                logger.warning(f"Web search failed: {search_data.get('error', 'Unknown error')}")
+                if 'application/json' in content_type:
+                    try:
+                        data = response.json()
+                        results = []
+                        for result in data.get("results", [])[:max_results]:
+                            basic_result = {
+                                "title": result.get("title", ""),
+                                "url": result.get("url", ""),
+                                "content": result.get("content", "")[:200] + "..." if len(result.get("content", "")) > 200 else result.get("content", ""),
+                            }
+                            results.append(basic_result)
+                        
+                        if results:
+                            formatted_search = "Here are some search results:\n\n" + "\n\n".join([f"{i+1}. [{r['title']}]({r['url']})\n   {r['content']}" for i, r in enumerate(results)])
+                            
+                            search_message = {
+                                "role": "user",
+                                "content": formatted_search
+                            }
+                            messages.insert(1, search_message)
+                            
+                            logging.info("Search results added to conversation")
+                    except Exception as e:
+                        logging.warning(f"JSON parsing failed: {e}")
+            except Exception as e:
+                logging.exception(f"Web search failed: {e}")
 
-    # System prompt handling
     system_prompt = llm_config.get("system_prompt") or ""
     
-    # Check for assistant_prefix (e.g., /nothink for KoboldCPP)
-    assistant_prefix = llm_config.get("assistant_prefix")
+    enable_jinja = llm_config.get("enable_jinja", False)
+    
+    completely_disable_reasoning = reasoning_config.get("completely_disable_reasoning", False)
     
     if system_prompt:
         now = datetime.now().astimezone()
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
         
-        if accept_usernames:
-            system_prompt += "\n\n{{user}} names are their Discord display names."
+        if not enable_jinja:
+            system_prompt = strip_jinja_templates(system_prompt)
         
-        # Add assistant_prefix to system prompt if configured
-        if assistant_prefix:
-            system_prompt += f"\n\n{assistant_prefix}"
-
         messages.append(dict(role="system", content=system_prompt))
-    else:
-        logger.info("No system prompt found in config")
-        # If no system prompt but assistant_prefix exists, create minimal message
-        if assistant_prefix:
-            messages.append(dict(role="system", content=assistant_prefix))
 
-    # Generate response
     curr_content = finish_reason = None
     response_msgs = []
     response_contents = []
@@ -1615,7 +967,7 @@ async def on_message(new_msg: discord.Message) -> None:
     if use_plain_responses := config.get("use_plain_responses", False):
         max_message_length = 4000
     else:
-        max_message_length = 4096
+        max_message_length = 4096 - len(STREAMING_INDICATOR)
         embed = discord.Embed.from_dict(dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]))
 
     async def reply_helper(**reply_kwargs) -> None:
@@ -1629,7 +981,7 @@ async def on_message(new_msg: discord.Message) -> None:
     try:
         async with new_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
-                if finish_reason != None:
+                if finish_reason is not None:
                     break
 
                 if not (choice := chunk.choices[0] if chunk.choices else None):
@@ -1640,7 +992,7 @@ async def on_message(new_msg: discord.Message) -> None:
                 prev_content = curr_content or ""
                 curr_content = choice.delta.content or ""
 
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
+                new_content = prev_content if finish_reason is None else (prev_content + curr_content)
 
                 if response_contents == [] and new_content == "":
                     continue
@@ -1654,67 +1006,12 @@ async def on_message(new_msg: discord.Message) -> None:
                     time_delta = datetime.now().timestamp() - last_task_time
 
                     ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
+                    msg_split_incoming = finish_reason is None and len(response_contents[-1] + curr_content) > max_message_length
+                    is_final_edit = finish_reason is not None or msg_split_incoming
+                    is_good_finish = finish_reason is not None and finish_reason.lower() in ("stop", "end_turn")
 
                     if start_next_msg or ready_to_edit or is_final_edit:
-                        # Process reasoning sections based on configuration
-                        reasoning_config = llm_config.get("reasoning") or {}
-                        show_reasoning = reasoning_config.get("show_reasoning", True)
-                        reasoning_format = reasoning_config.get("reasoning_format", "spoiler")
-                        start_tag = reasoning_config.get("reasoning_start_tag", "<THINKING>")
-                        end_tag = reasoning_config.get("reasoning_end_tag", "</THINKING>")
-                        disable_thinking_display = reasoning_config.get("disable_thinking_display", False)
-                        thinking_tags_config = reasoning_config.get("thinking_tags", None)
-                        completely_disable_reasoning = reasoning_config.get("completely_disable_reasoning", False)
-                        
-                        # Debug logging to verify config is read correctly
-                        logger.info(f"Reasoning config check: completely_disable={completely_disable_reasoning}, disable_display={disable_thinking_display}, show={show_reasoning}")
-                        logger.info(f"Reasoning config raw: {reasoning_config}")
-                        
-                        # Remove the STREAMING_INDICATOR from the displayed content
-                        display_content = response_contents[-1]
-                        if display_content.endswith(STREAMING_INDICATOR):
-                            display_content = display_content[:-len(STREAMING_INDICATOR)]
-                        
-                        # Apply robust thinking tag removal if thinking display is disabled
-                        if completely_disable_reasoning and display_content:
-                            # Completely strip all thinking tags and content - no reasoning at all
-                            logger.info(f"Stripping thinking tags (completely_disable_reasoning). Original length: {len(display_content)}")
-                            final_content = strip_all_thinking_tags(display_content, thinking_tags_config)
-                            logger.info(f"After stripping length: {len(final_content)}")
-                        elif disable_thinking_display and display_content:
-                            # Use the new regex-based stripping for robust tag removal
-                            logger.info(f"Stripping thinking tags (disable_thinking_display). Original length: {len(display_content)}")
-                            final_content = strip_all_thinking_tags(display_content, thinking_tags_config)
-                            logger.info(f"After stripping length: {len(final_content)}")
-                        elif show_reasoning and display_content:
-                            # Legacy reasoning processing for spoiler/separate formats
-                            processed_content, reasoning_content, has_reasoning = process_reasoning_content(
-                                display_content,
-                                reasoning_format,
-                                start_tag,
-                                end_tag
-                            )
-                            
-                            # Apply format-specific handling
-                            if reasoning_format == "spoiler" and has_reasoning:
-                                final_content = processed_content
-                            elif reasoning_format == "separate" and has_reasoning:
-                                final_content = processed_content
-                            else:
-                                final_content = display_content
-                        else:
-                            # Completely remove reasoning sections if not showing
-                            clean_content, _ = extract_reasoning(display_content, start_tag, end_tag)
-                            final_content = clean_content if clean_content else display_content
-                        
-                        # Truncate if needed
-                        if len(final_content) > max_message_length:
-                            final_content = final_content[:max_message_length-3] + "..."
-                        
-                        embed.description = final_content if is_final_edit else final_content
+                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
                         embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
                         if start_next_msg:
@@ -1729,8 +1026,8 @@ async def on_message(new_msg: discord.Message) -> None:
                 for content in response_contents:
                     await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
 
-    except Exception as e:
-        logger.exception(f"Error while generating response: {e}")
+    except Exception:
+        logging.exception("Error while generating response")
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
@@ -1741,8 +1038,10 @@ async def on_message(new_msg: discord.Message) -> None:
             async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
                 msg_nodes.pop(msg_id, None)
 
+
 async def main() -> None:
     await discord_bot.start(config["bot_token"])
+
 
 try:
     asyncio.run(main())

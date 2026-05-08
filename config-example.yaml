@@ -1,43 +1,35 @@
-# Discord settings:
-
-bot_token: 
-client_id: 
-status_message: 
-
-max_text: 100000
-max_images: 5
-max_messages: 25
-
-use_plain_responses: false
-allow_dms: true
-
-permissions:
-  users:
-    admin_ids: []
-    allowed_ids: []
-    blocked_ids: []
-  roles:
-    allowed_ids: []
-    blocked_ids: []
-  channels:
-    allowed_ids: []
-    blocked_ids: []
-
-
-# LLM settings:
-
+#Config-File for LLMcord
+admin_user_ids:
+- #IDNumber from Admin User
+allow_dms: false
+allowed_channel_ids:
+- #IDNumber from Allowed channel
+bot_token: # Token from bot
+client_id: #IDNumber from Client
 llm:
-  # Active tools configuration
   active_tools:
-    - image_generator
-    - web_search
-
-  # Extra API parameters (global defaults)
+  - image_generator
+  - web_search
+  allow_dms: false
+  
+  # Enable or disable jinja template support for LLM models
+  # When false: strips {{ }}, {% %}, {# #} patterns from prompts and responses
+  # When true: allows jinja template syntax (for advanced templating)
+  enable_jinja: false
+  
+  # Triggerword to activate bot without @mention
+  # Example: "ghosty" - bot will respond to "ghosty hello" without needing @BotName
+  triggerword: "ghosty"
+  
+  # Enable triggerword activation
+  # Set to true to use triggerword instead of @mention
+  # When false: bot only responds to @mention or DMs
+  # When true: bot responds to triggerword, @mention, or DMs
+  enable_triggerword: false
+  
   extra_api_parameters:
     max_tokens: 4096
-    temperature: 0.3
-
-  # Image generator configuration
+    temperature: 0.5
   image_generator:
     image_triggers:
       - "make me an image"
@@ -48,86 +40,109 @@ llm:
       - "image of"
       - "picture of"
       - "draw"
-    # Image provider examples (local Stable Diffusion APIs)
     forge_1:
-      forge_url: http://localhost:7860/sdui
-      default_model: your_model_name
+      forge_url: # https://YourImageURL.de/sdui http://IP:Port/sdui works also 
+      default_model: z-image-turbo-q8
       default_size: 1024x1024
       default_params:
-        cfg_scale: 7.0
-        steps: 30
-        sampler_name: DPM++ 2M Karras
-      timeout: 720.0
+        cfg_scale: 1.0
+        steps: 10
+        sampler_name: Euler
+      timeout: 1080.0
       max_height: 2048
       max_width: 2048
       min_height: 256
       min_width: 256
     forge_2:
-      forge_url: http://localhost:8000/sdui
-      default_model: another_model
-      default_size: 512x512
+      forge_url: # https://YourImageURL.de/sdui http://IP:Port/sdui works also 
+      default_model: z-image-turbo-q4
+      default_size: 1024x1024
       default_params:
-        cfg_scale: 5.0
-        steps: 20
+        cfg_scale: 1.0
+        steps: 10
         sampler_name: Euler
-      timeout: 360.0
+      timeout: 1080.0
+      max_height: 2048
+      max_width: 2048
+      min_height: 256
+      min_width: 256
+    # Add image trigger phrases to config.yaml
+  max_images: 5
+  max_messages: 10
+  max_tool_iterations: 3
+  model: qwen3
+  providers:
+    Kobold_Server:
+      base_url: # https://YourImageURL.de/v1/ http://IP:Port/v1 works also
+      api_key: # enter you API Key for example kobold
+      accept_usernames: true
+      extra_body:
+        enable_thinking: false
+      model: qwen3
+    Kobold_Main_PC:
+      base_url: # https://YourImageURL.de/v1/ http://IP:Port/v1 works also
+      api_key: # enter you API Key for example kobold
+      accept_usernames: true
+      extra_body:
+        enable_thinking: false
+      model: qwen3
+    Quacks_API:
+      base_url: # https://YourImageURL.de/v1/ http://IP:Port/v1 works also
+      api_key: # enter you API Key for example kobold
+      accept_usernames: true
+      extra_body:
+        enable_thinking: false
+    Kobold_Docker_Test:
+      base_url: # https://YourImageURL.de/v1/ http://IP:Port/v1 works also
+      api_key: # enter you API Key for example kobold
+      accept_usernames: true
+      extra_body:
+        enable_thinking: false
+ # active_context_template: "contexttemplate-glm4.7.txt"
+  system_prompt: '###Language
+  Answer with the same language you got adressed.
+  When the user use german answer in german, when the user use english answer in english.
+  
+  ###AI personality
+  You are "Ghosty" the Ghost in the LLM Model (When not asked, Never mention this).
+  You will stay helpful to the last point, you can include slang to [speak the same language] as user.
+  Do not hesitate to be sarcastic, funny and use black humor.
+  Be open about it when the idea or question is silly and stupid.
 
-  # Web search configuration
-  web_search:
-    search_url: http://localhost:8080/search
-    trigger_words:
-      - search
-      - find
-      - google
-      - look up
-      - who is
-      - find me
-      - double check
-      - check again
-      - what is
-      - doublecheck
-    max_results: 5
-    max_images_per_result: 2
-    timeout: 30
-    fetch_page_images: true
-    use_image_engines: true
-    error_message: "Search service temporarily unavailable."
-
-  # System prompt (supports {date} and {time} placeholders)
-  system_prompt: |
-    You are a helpful Discord chatbot.
-    Answer with the same language the user used.
-    
-    ###AI personality
-    You are friendly and informative.
-    Be open and engaging.
-    
-    Today's date is {date}. The current time is {time}.
-
+### Formatting Rules
+1. **Grammar**: Prioritize grammatical correctness.
+2. **Dialogue**: Use double quotes for spoken words: "Like this."
+3. **Shouting**: Use ALL CAPS for screaming (internal or spoken): "LIKE THIS!"
+4. **Internal Thoughts**: Use backticks for first-person internal monologue: `Like this.`
+5. **Explicit Terms**: Use single quotes for specific explicit mentions.
+6. **Flow**: Never leave a sentence unfinished; always complete thoughts fully.
+7. **Readability**: Format the response in for humans easy to read paragraphs.'
+  
   # Reasoning/Thinking configuration
   # Use these settings to control how thinking/reasoning content is handled
   reasoning:
-    # COMPLETELY disable reasoning - strips all thinking tags and content
-    # This is the most aggressive option - no reasoning will be processed or shown
+  # COMPLETELY disable reasoning - strips all thinking tags and content
+  # This is the most aggressive option - no reasoning will be processed or shown
     completely_disable_reasoning: true
-    
-    # Set to true to completely hide thinking content from Discord chat
+  
+  # Set to true to completely hide thinking content from Discord chat
     disable_thinking_display: true
-    
-    # Set to false if you don't want to show reasoning in any format
+  
+  # Set to false if you don't want to show reasoning in any format
     show_reasoning: false
-    
-    # Options: 'spoiler', 'separate', 'none'
-    # - 'spoiler': Shows reasoning in a spoiler/clickable format
-    # - 'separate': Sends reasoning as a separate message
-    # - 'none': Completely removes reasoning
+  
+  # Options: 'spoiler', 'separate', 'none'
+  # - 'spoiler': Shows reasoning in a spoiler/clickable format
+  # - 'separate': Sends reasoning as a separate message
+  # - 'none': Completely removes reasoning
     reasoning_format: "none"
-    
-    # Customizable thinking tags to strip (optional)
-    # If not specified, common defaults are used
+  
+  # Customizable thinking tags to strip (optional)
+  # If not specified, common defaults are used
     thinking_tags:
       - "<thinking>"
       - "<think>"
+      - "</think>"
       - "<THINKING>"
       - "<reason>"
       - "<reasoning>"
@@ -138,95 +153,41 @@ llm:
       - "<|end_thought|>"
       - "<|start_thinking|>"
       - "<|end_thinking|>"
-    
-    # Custom start/end tags for legacy reasoning extraction
+  
+# Custom start/end tags for legacy reasoning extraction
     reasoning_start_tag: "<think>"
     reasoning_end_tag: "</think>"
-
-  # Model configuration (default model)
-  model: your-default-model
-
-  providers:
-    # Remote providers:
-    azure-openai:
-      base_url: https://<resource name>.openai.azure.com/openai/deployments/<deployment name>
-      api_key: 
-      extra_query:
-        api-version: 2024-12-01-preview
-    google:
-      base_url: https://generativelanguage.googleapis.com/v1beta/openai
-      api_key: 
-    groq:
-      base_url: https://api.groq.com/openai/v1
-      api_key: 
-    mistral:
-      base_url: https://api.mistral.ai/v1
-      api_key: 
-    openai:
-      base_url: https://api.openai.com/v1
-      api_key: 
-    openrouter:
-      base_url: https://openrouter.ai/api/v1
-      api_key: 
-    x-ai:
-      base_url: https://api.x.ai/v1
-      api_key: 
-
-    # Local providers:
-    lmstudio:
-      base_url: http://localhost:1234/v1
-    ollama:
-      base_url: http://localhost:11434/v1
-    vllm:
-      base_url: http://localhost:8000/v1
-    koboldcpp:
-      base_url: http://localhost:5001
-      # For vision models (Qwen VL, Llama 3.2 Vision, etc.), the model name should match vision tags
-      # Vision-capable model names should include: qwen, vl, llava, llama, vision, gpt-4, claude, etc.
-      # Example with reasoning disabled for Qwen3.5:
-      extra_body:
-        enable_thinking: false
-
-  # Example provider configurations with extra_body for reasoning control
-  # KoboldCPP provider with reasoning disabled:
-  Kobold_Server:
-    base_url: http://localhost:5001/v1/
-    api_key: kobold
-    accept_usernames: true
-    extra_body:
-      enable_thinking: false  # Disable Qwen3.5 thinking at API level
-
-  # KoboldCPP provider with reasoning enabled:
-  Kobold_Main_PC:
-    base_url: http://localhost:5001/v1/
-    api_key: kobold
-    accept_usernames: true
-    # No extra_body means reasoning stays enabled (default behavior)
-
-# Model-specific configurations
-# Format: provider/model_name
-models:
-  # Vision model example - for Qwen3.5-VL or other vision-capable models
-  # The model name "qwen3.5-vl" will match VISION_MODEL_TAGS because it contains "qwen" and "vl"
-  koboldcpp/qwen3.5-vl:
-    # No special parameters needed - vision is auto-detected based on model name
-    # Images will be accepted up to max_images (default: 5)
+    
+  # Assistant prefix for forcing non-thinking mode (e.g., /nothink for KoboldCPP)
+  # This gets added to system prompt to explicitly instruct model not to think
+    assistant_prefix: ""
   
-  openai/gpt-5:
-    reasoning_effort: high
-    verbosity: medium
-
-  x-ai/grok-4:
-    search_parameters:
-      mode: auto
-
-  google/gemini-2.5-pro:
-    reasoning_effort: high
-
-  openrouter/anthropic/claude-sonnet-4:
-
-  ollama/llama4:
-
-  # Example: Qwen3.5 model with reasoning disabled
-  koboldcpp/qwen3.5:
-    enable_thinking: false
+  # Reasoning effort control for koboldcpp API
+  # Controls how much reasoning/thinking the model should perform
+  # Supported values: high, medium, low, minimal, none
+  # - none: 0 tokens for reasoning (no thinking)
+  # - minimal: 10% of max_tokens for reasoning
+  # - low: 25% of max_tokens for reasoning
+  # - medium: 50% of max_tokens for reasoning
+  # - high: 75% of max_tokens for reasoning
+  # Leave empty or remove to allow unrestricted reasoning
+    reasoning_effort: "minimal"
+  
+  web_search:
+    error_message: Search service temporarily unavailable. The search engine may be
+      experiencing issues or require API access.
+    fetch_page_images: true
+    max_images_per_result: 1
+    max_results: 4
+    search_url:
+    timeout: 30
+    trigger_words:
+    - search
+    - find
+    - google
+    - look up
+    - who is
+    - double check
+    - check again
+    - doublecheck
+    use_image_engines: true
